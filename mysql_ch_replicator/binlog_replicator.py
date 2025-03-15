@@ -164,9 +164,11 @@ class DataReader:
         return False
 
     def get_file_with_transaction(self, existing_file_nums, transaction_id):
+        print(f"Searching for transaction {transaction_id} in files: {existing_file_nums}")
         matching_file_num = None
         prev_file_num = None
         for file_num in existing_file_nums:
+            print(f"Checking file {file_num}...")
             file_first_transaction = self.get_first_transaction_in_file(file_num)
             if file_first_transaction > transaction_id:
                 matching_file_num = prev_file_num
