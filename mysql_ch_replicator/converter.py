@@ -39,7 +39,7 @@ CHARSET_MYSQL_TO_PYTHON = {
     'keybcs2': None,           # KEYBCS2 is not directly supported in Python
     'koi8r': 'koi8_r',
     'koi8u': 'koi8_u',
-    'latin1': 'latin1',        # MySQL's latin1 corresponds to Windows-1252
+    'latin1': 'cp1252',        # MySQL's latin1 corresponds to Windows-1252
     'latin2': 'iso8859_2',
     'latin5': 'iso8859_9',
     'latin7': 'iso8859_13',
