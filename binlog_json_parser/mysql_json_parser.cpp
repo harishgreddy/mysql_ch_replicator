@@ -233,6 +233,7 @@ static std::string parse_scalar(uint8_t type, const char *data, size_t len, size
       //        }
     default:
       // Not a valid scalar type.
+      std::cerr << "Unknown JSONB type: " << (int)type << std::endl;
       throw std::runtime_error("invalid scalar type");
   }
 }
