@@ -211,6 +211,39 @@ static std::string parse_scalar(uint8_t type, const char *data, size_t len, size
       result += '"';
       return result;
     }
+    case JSONB_TYPE_OPAQUE: {
+        if (len < 1) {
+            throw std::runtime_error("invalid opaque length");
+        }
+
+        uint8_t field_type = static_cast<uint8_t>(*data); // First byte is MySQL field type
+        uint32_t value_length;
+        uint8_t num_bytes;
+
+        // Read the length of the opaque value
+        if (read_variable_length(data + 1, len - 1, &value_length, &num_bytes)) {
+            throw std::runtime_error("failed to read opaque length");
+        }
+
+        if (len < 1 + num_bytes + value_length) {
+            throw std::runtime_error("invalid opaque value length");
+        }
+
+        std::string opaque_value = escape_json(std::string(data + 1 + num_bytes, value_length));
+
+        // Convert known MySQL types
+        switch (field_type) {
+            case 0xf6: // MYSQL_TYPE_DECIMAL
+            case 0x00: // MYSQL_TYPE_NEWDECIMAL
+                return "\"DECIMAL(" + opaque_value + ")\"";
+            case 0x0a: // MYSQL_TYPE_DATE
+            case 0x0c: // MYSQL_TYPE_DATETIME
+            case 0x0d: // MYSQL_TYPE_TIME
+                return "\"DATETIME(" + opaque_value + ")\"";
+            default:
+                return "\"OPAQUE(" + opaque_value + ")\""; // Default for unknown types
+        }
+    }
       //        case JSONB_TYPE_OPAQUE: {
       //            /*
       //              There should always be at least one byte, which tells the field
