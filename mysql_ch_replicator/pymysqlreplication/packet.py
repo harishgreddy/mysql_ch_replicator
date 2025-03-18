@@ -347,7 +347,11 @@ class BinLogPacketWrapper(object):
             # handle NULL value
             return None
         data = self.read(length)
-        return cpp_mysql_to_json(data).decode('utf-8')
+        try:
+            return cpp_mysql_to_json(data).decode('utf-8', errors='replace')  # Replaces invalid characters
+        except UnicodeDecodeError:
+            print(f"⚠️ Warning: Non-UTF-8 data encountered at position {len(data)}")
+            return cpp_mysql_to_json(data).decode('latin1')  # Fallback to Latin-1
 
         #
         # if is_partial:
