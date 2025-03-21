@@ -383,6 +383,14 @@ class MysqlToClickhouseConverter:
             clickhouse_field_value = mysql_field_value
             mysql_field_type = mysql_field_types[idx]
             clickhouse_field_type = clickhouse_field_types[idx]
+
+            # --- Fix for BIT(1) fields ---
+            if mysql_field_type.startswith('bit') and 'Bool' in clickhouse_field_type:
+                if isinstance(clickhouse_field_value, (bytes, bytearray)):
+                    clickhouse_field_value = int.from_bytes(clickhouse_field_value, byteorder='big') != 0
+                else:
+                    clickhouse_field_value = bool(clickhouse_field_value)
+
             if mysql_field_type.startswith('time') and 'String' in clickhouse_field_type:
                 clickhouse_field_value = str(mysql_field_value)
             if mysql_field_type == 'json' and 'String' in clickhouse_field_type:
