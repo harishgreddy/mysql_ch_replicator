@@ -388,15 +388,25 @@ class MysqlToClickhouseConverter:
             if mysql_field_type.startswith('bit(') and mysql_field_type.endswith(')'):
                 try:
                     bit_len = int(mysql_field_type[4:-1])
-                    if isinstance(clickhouse_field_value, (bytes, bytearray)):
-                        val = int.from_bytes(clickhouse_field_value, byteorder='big')
-                        if bit_len == 1 and 'Bool' in clickhouse_field_type:
-                            clickhouse_field_value = val != 0
+                    if bit_len == 1 and 'Bool' in clickhouse_field_type:
+                        if isinstance(clickhouse_field_value, (bytes, bytearray)):
+                            clickhouse_field_value = int.from_bytes(clickhouse_field_value, byteorder='big') != 0
+                        elif isinstance(clickhouse_field_value, str):
+                            clickhouse_field_value = clickhouse_field_value != '0'
+                        elif isinstance(clickhouse_field_value, int):
+                            clickhouse_field_value = clickhouse_field_value != 0
+                        elif isinstance(clickhouse_field_value, bool):
+                            pass  # already correct
                         else:
-                            clickhouse_field_value = val
+                            clickhouse_field_value = bool(clickhouse_field_value)
+                    else:
+                        # For BIT(n > 1)
+                        if isinstance(clickhouse_field_value, (bytes, bytearray)):
+                            clickhouse_field_value = int.from_bytes(clickhouse_field_value, byteorder='big')
+                        elif isinstance(clickhouse_field_value, str):
+                            clickhouse_field_value = int(clickhouse_field_value)
                 except Exception:
-                    # Fail-safe fallback (won't crash if parsing fails)
-                    pass
+                    pass  # fail-safe fallback
 
             if mysql_field_type.startswith('time') and 'String' in clickhouse_field_type:
                 clickhouse_field_value = str(mysql_field_value)
