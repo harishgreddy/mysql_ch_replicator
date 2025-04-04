@@ -4,6 +4,7 @@ import uuid
 import sqlparse
 import re
 from pyparsing import Suppress, CaselessKeyword, Word, alphas, alphanums, delimitedList
+import copy
 
 from .table_structure import TableStructure, TableField
 from .enum import (
@@ -132,6 +133,55 @@ def parse_mysql_point(binary):
     return (x, y)
 
 
+def parse_mysql_polygon(binary):
+    """
+    Parses the binary representation of a MySQL POLYGON data type
+    and returns a list of tuples [(x1,y1), (x2,y2), ...] representing the polygon vertices.
+
+    :param binary: The binary data representing the POLYGON.
+    :return: A list of tuples with the coordinate values.
+    """
+    if binary is None:
+        return []
+
+    # Determine if SRID is present (25 bytes for header with SRID, 21 without)
+    has_srid = len(binary) > 25
+    offset = 4 if has_srid else 0
+
+    # Read byte order
+    byte_order = binary[offset]
+    if byte_order == 0:
+        endian = '>'
+    elif byte_order == 1:
+        endian = '<'
+    else:
+        raise ValueError("Invalid byte order in WKB POLYGON")
+
+    # Read WKB Type
+    wkb_type = struct.unpack(endian + 'I', binary[offset + 1:offset + 5])[0]
+    if wkb_type != 3:  # WKB type 3 means POLYGON
+        raise ValueError("Not a WKB POLYGON type")
+
+    # Read number of rings (polygons can have holes)
+    num_rings = struct.unpack(endian + 'I', binary[offset + 5:offset + 9])[0]
+    if num_rings == 0:
+        return []
+
+    # Read the first ring (outer boundary)
+    ring_offset = offset + 9
+    num_points = struct.unpack(endian + 'I', binary[ring_offset:ring_offset + 4])[0]
+    points = []
+    
+    # Read each point in the ring
+    for i in range(num_points):
+        point_offset = ring_offset + 4 + (i * 16)  # 16 bytes per point (8 for x, 8 for y)
+        x = struct.unpack(endian + 'd', binary[point_offset:point_offset + 8])[0]
+        y = struct.unpack(endian + 'd', binary[point_offset + 8:point_offset + 16])[0]
+        points.append((x, y))
+
+    return points
+
+
 def strip_sql_name(name):
     name = name.strip()
     if name.startswith('`'):
@@ -199,6 +249,9 @@ class MysqlToClickhouseConverter:
 
         if mysql_type == 'point':
             return 'Tuple(x Float32, y Float32)'
+
+        if mysql_type == 'polygon':
+            return 'Array(Tuple(x Float32, y Float32))'
 
         # Correctly handle numeric types
         if mysql_type.startswith('numeric'):
@@ -328,6 +381,8 @@ class MysqlToClickhouseConverter:
             return 'String'
         if 'set(' in mysql_type:
             return 'String'
+        if mysql_type == 'year':
+            return 'UInt16'  # MySQL YEAR type can store years from 1901 to 2155, UInt16 is sufficient
         raise Exception(f'unknown mysql type "{mysql_type}"')
 
     def convert_field_type(self, mysql_type, mysql_parameters):
@@ -457,6 +512,9 @@ class MysqlToClickhouseConverter:
             if mysql_field_type.startswith('point'):
                 clickhouse_field_value = parse_mysql_point(clickhouse_field_value)
 
+            if mysql_field_type.startswith('polygon'):
+                clickhouse_field_value = parse_mysql_polygon(clickhouse_field_value)
+
             if mysql_field_type.startswith('enum('):
                 enum_values = mysql_structure.fields[idx].additional_data
                 field_name = mysql_structure.fields[idx].name if idx < len(mysql_structure.fields) else "unknown"
@@ -466,6 +524,18 @@ class MysqlToClickhouseConverter:
                     enum_values,
                     field_name
                 )
+
+            # Handle MySQL YEAR type conversion
+            if mysql_field_type == 'year' and clickhouse_field_value is not None:
+                # MySQL YEAR type can store years from 1901 to 2155
+                # Convert to integer if it's a string
+                if isinstance(clickhouse_field_value, str):
+                    clickhouse_field_value = int(clickhouse_field_value)
+                # Ensure the value is within valid range
+                if clickhouse_field_value < 1901:
+                    clickhouse_field_value = 1901
+                elif clickhouse_field_value > 2155:
+                    clickhouse_field_value = 2155
 
             clickhouse_record.append(clickhouse_field_value)
         return tuple(clickhouse_record)
@@ -760,7 +830,88 @@ class MysqlToClickhouseConverter:
                 query = f'ALTER TABLE `{db_name}`.`{table_name}` RENAME COLUMN {column_name} TO {new_column_name}'
                 self.db_replicator.clickhouse_api.execute_command(query)
 
+    def _handle_create_table_like(self, create_statement, source_table_name, target_table_name, is_query_api=True):
+        """
+        Helper method to handle CREATE TABLE LIKE statements.
+        
+        Args:
+            create_statement: The original CREATE TABLE LIKE statement
+            source_table_name: Name of the source table being copied
+            target_table_name: Name of the new table being created
+            is_query_api: If True, returns both MySQL and CH structures; if False, returns only MySQL structure
+            
+        Returns:
+            Either (mysql_structure, ch_structure) if is_query_api=True, or just mysql_structure otherwise
+        """
+        # Try to get the actual structure from the existing table structures first
+        if (hasattr(self, 'db_replicator') and 
+            self.db_replicator is not None and 
+            hasattr(self.db_replicator, 'state') and
+            hasattr(self.db_replicator.state, 'tables_structure')):
+            
+            # Check if the source table structure is already in our state
+            if source_table_name in self.db_replicator.state.tables_structure:
+                # Get the existing structure
+                source_mysql_structure, source_ch_structure = self.db_replicator.state.tables_structure[source_table_name]
+                
+                # Create a new structure with the target table name
+                new_mysql_structure = copy.deepcopy(source_mysql_structure)
+                new_mysql_structure.table_name = target_table_name
+                
+                # Convert to ClickHouse structure 
+                new_ch_structure = copy.deepcopy(source_ch_structure)
+                new_ch_structure.table_name = target_table_name
+                
+                return (new_mysql_structure, new_ch_structure) if is_query_api else new_mysql_structure
+        
+        # If we couldn't get it from state, try with MySQL API
+        if (hasattr(self, 'db_replicator') and 
+            self.db_replicator is not None and 
+            hasattr(self.db_replicator, 'mysql_api') and 
+            self.db_replicator.mysql_api is not None):
+            
+            try:
+                # Get the CREATE statement for the source table
+                source_create_statement = self.db_replicator.mysql_api.get_table_create_statement(source_table_name)
+                
+                # Parse the source table structure
+                source_structure = self.parse_mysql_table_structure(source_create_statement)
+                
+                # Copy the structure but keep the new table name
+                mysql_structure = copy.deepcopy(source_structure)
+                mysql_structure.table_name = target_table_name
+                
+                if is_query_api:
+                    # Convert to ClickHouse structure
+                    ch_structure = self.convert_table_structure(mysql_structure)
+                    return mysql_structure, ch_structure
+                else:
+                    return mysql_structure
+                    
+            except Exception as e:
+                error_msg = f"Could not get source table structure for LIKE statement: {str(e)}"
+                print(f"Error: {error_msg}")
+                raise Exception(error_msg, create_statement)
+        
+        # If we got here, we couldn't determine the structure
+        raise Exception(f"Could not determine structure for source table '{source_table_name}' in LIKE statement", create_statement)
+
     def parse_create_table_query(self, mysql_query) -> tuple[TableStructure, TableStructure]:
+        # Special handling for CREATE TABLE LIKE statements
+        if 'LIKE' in mysql_query.upper():
+            # Check if this is a CREATE TABLE LIKE statement using regex
+            create_like_pattern = r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[`"]?([^`"\s]+)[`"]?\s+LIKE\s+[`"]?([^`"\s]+)[`"]?'
+            match = re.search(create_like_pattern, mysql_query, re.IGNORECASE)
+            
+            if match:
+                # This is a CREATE TABLE LIKE statement
+                new_table_name = match.group(1).strip('`"')
+                source_table_name = match.group(2).strip('`"')
+                
+                # Use the common helper method to handle the LIKE statement
+                return self._handle_create_table_like(mysql_query, source_table_name, new_table_name, True)
+
+        # Regular parsing for non-LIKE statements
         mysql_table_structure = self.parse_mysql_table_structure(mysql_query)
         ch_table_structure = self.convert_table_structure(mysql_table_structure)
         return mysql_table_structure, ch_table_structure
@@ -803,6 +954,18 @@ class MysqlToClickhouseConverter:
         # get_real_name() returns the table name if the token is in the
         # style `<dbname>.<tablename>`
         structure.table_name = strip_sql_name(tokens[2].get_real_name())
+
+        # Handle CREATE TABLE ... LIKE statements
+        if len(tokens) > 4 and tokens[3].normalized.upper() == 'LIKE':
+            # Extract the source table name
+            if not isinstance(tokens[4], sqlparse.sql.Identifier):
+                raise Exception('wrong create statement', create_statement)
+            
+            source_table_name = strip_sql_name(tokens[4].get_real_name())
+            target_table_name = strip_sql_name(tokens[2].get_real_name())
+            
+            # Use the common helper method to handle the LIKE statement
+            return self._handle_create_table_like(create_statement, source_table_name, target_table_name, False)
 
         if not isinstance(tokens[3], sqlparse.sql.Parenthesis):
             raise Exception('wrong create statement', create_statement)

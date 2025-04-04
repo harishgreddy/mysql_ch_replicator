@@ -75,6 +75,7 @@ class ClickhouseSettings:
 class BinlogReplicatorSettings:
     data_dir: str = 'binlog'
     records_per_file: int = 100000
+    binlog_retention_period: int = 43200  # 12 hours in seconds
 
     def validate(self):
         if not isinstance(self.data_dir, str):
@@ -85,6 +86,12 @@ class BinlogReplicatorSettings:
 
         if self.records_per_file <= 0:
             raise ValueError('binlog_replicator records_per_file should be positive')
+
+        if not isinstance(self.binlog_retention_period, int):
+            raise ValueError(f'binlog_replicator binlog_retention_period should be int and not {stype(self.binlog_retention_period)}')
+
+        if self.binlog_retention_period <= 0:
+            raise ValueError('binlog_replicator binlog_retention_period should be positive')
 
 
 class Settings:
@@ -112,6 +119,7 @@ class Settings:
         self.http_port = 0
         self.types_mapping = {}
         self.target_databases = {}
+        self.initial_replication_threads = 0
 
     def load(self, settings_file):
         data = open(settings_file, 'r').read()
@@ -136,6 +144,7 @@ class Settings:
         self.http_host = data.pop('http_host', '')
         self.http_port = data.pop('http_port', 0)
         self.target_databases = data.pop('target_databases', {})
+        self.initial_replication_threads = data.pop('initial_replication_threads', 0)
 
         indexes = data.pop('indexes', [])
         for index in indexes:
@@ -195,3 +204,7 @@ class Settings:
         self.validate_log_level()
         if not isinstance(self.target_databases, dict):
             raise ValueError(f'wrong target databases {self.target_databases}')
+        if not isinstance(self.initial_replication_threads, int):
+            raise ValueError(f'initial_replication_threads should be an integer, not {type(self.initial_replication_threads)}')
+        if self.initial_replication_threads < 0:
+            raise ValueError(f'initial_replication_threads should be non-negative')

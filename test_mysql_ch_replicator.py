@@ -14,7 +14,7 @@ from mysql_ch_replicator import config
 from mysql_ch_replicator import mysql_api
 from mysql_ch_replicator import clickhouse_api
 from mysql_ch_replicator.binlog_replicator import State as BinlogState, FileReader, EventType, BinlogReplicator
-from mysql_ch_replicator.db_replicator import State as DbReplicatorState, DbReplicator
+from mysql_ch_replicator.db_replicator import State as DbReplicatorState, DbReplicator, DbReplicatorInitial
 from mysql_ch_replicator.converter import MysqlToClickhouseConverter
 
 from mysql_ch_replicator.runner import ProcessRunner
@@ -316,9 +316,10 @@ def get_db_replicator_pid(cfg: config.Settings, db_name: str):
     return state.pid
 
 
-def test_runner():
+@pytest.mark.parametrize('cfg_file', [CONFIG_FILE, 'tests_config_parallel.yaml'])
+def test_runner(cfg_file):
     cfg = config.Settings()
-    cfg.load(CONFIG_FILE)
+    cfg.load(cfg_file)
 
     mysql = mysql_api.MySQLApi(
         database=None,
@@ -367,7 +368,7 @@ CREATE TABLE `{TEST_TABLE_NAME}` (
 
     mysql.execute(f"INSERT INTO `group` (name, age, rate) VALUES ('Peter', 33, 10.2);", commit=True)
 
-    run_all_runner = RunAllRunner()
+    run_all_runner = RunAllRunner(cfg_file=cfg_file)
     run_all_runner.run()
 
     assert_wait(lambda: TEST_DB_NAME in ch.get_databases())
@@ -422,6 +423,8 @@ CREATE TABLE `{TEST_TABLE_NAME}` (
         commit=True,
     )
 
+    assert_wait(lambda: TEST_DB_NAME in ch.get_databases())
+
     assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == 5)
     assert_wait(lambda: ch.select(TEST_TABLE_NAME, "age=1912")[0]['name'] == 'Hällo')
 
@@ -430,6 +433,8 @@ CREATE TABLE `{TEST_TABLE_NAME}` (
 
     requests.get('http://localhost:9128/restart_replication')
     time.sleep(1.0)
+
+    assert_wait(lambda: TEST_DB_NAME in ch.get_databases())
 
     assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == 5)
     assert_wait(lambda: ch.select(TEST_TABLE_NAME, "age=1912")[0]['name'] == 'Hällo')
@@ -569,6 +574,129 @@ CREATE TABLE `{TEST_TABLE_NAME}` (
     db_replicator_runner.stop()
 
 
+def test_parallel_initial_replication_record_versions():
+    """
+    Test that record versions are properly consolidated from worker states
+    after parallel initial replication.
+    """
+    # Only run this test with parallel configuration
+    cfg_file = 'tests_config_parallel.yaml'
+    cfg = config.Settings()
+    cfg.load(cfg_file)
+    
+    # Ensure we have parallel replication configured
+    assert cfg.initial_replication_threads > 1, "This test requires initial_replication_threads > 1"
+    
+    mysql = mysql_api.MySQLApi(
+        database=None,
+        mysql_settings=cfg.mysql,
+    )
+
+    ch = clickhouse_api.ClickhouseApi(
+        database=TEST_DB_NAME,
+        clickhouse_settings=cfg.clickhouse,
+    )
+
+    prepare_env(cfg, mysql, ch)
+
+    # Create a table with sufficient records for parallel processing
+    mysql.execute(f'''
+CREATE TABLE `{TEST_TABLE_NAME}` (
+    id int NOT NULL AUTO_INCREMENT,
+    name varchar(255),
+    age int,
+    version int NOT NULL DEFAULT 1,
+    PRIMARY KEY (id)
+); 
+    ''')
+
+    # Insert a large number of records to ensure parallel processing
+    for i in range(1, 1001):
+        mysql.execute(
+            f"INSERT INTO `{TEST_TABLE_NAME}` (name, age, version) VALUES ('User{i}', {20+i%50}, {i});", 
+            commit=(i % 100 == 0)  # Commit every 100 records
+        )
+    
+    # Run initial replication only with parallel workers
+    db_replicator_runner = DbReplicatorRunner(TEST_DB_NAME, cfg_file=cfg_file)
+    db_replicator_runner.run()
+
+    assert_wait(lambda: TEST_DB_NAME in ch.get_databases(), max_wait_time=10.0)
+
+    ch.execute_command(f'USE `{TEST_DB_NAME}`')
+
+    assert_wait(lambda: TEST_TABLE_NAME in ch.get_tables(), max_wait_time=10.0)
+    assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == 1000, max_wait_time=10.0)
+
+    db_replicator_runner.stop()
+
+    # Verify database and table were created
+    assert TEST_DB_NAME in ch.get_databases()
+    ch.execute_command(f'USE `{TEST_DB_NAME}`')
+    assert TEST_TABLE_NAME in ch.get_tables()
+    
+    # Verify all records were replicated
+    records = ch.select(TEST_TABLE_NAME)
+    assert len(records) == 1000
+    
+    # Instead of reading the state file directly, verify the record versions are correctly handled
+    # by checking the max _version in the ClickHouse table
+    versions_query = ch.query(f"SELECT MAX(_version) FROM `{TEST_DB_NAME}`.`{TEST_TABLE_NAME}`")
+    max_version_in_ch = versions_query.result_rows[0][0]
+    assert max_version_in_ch >= 200, f"Expected max _version to be at least 200, got {max_version_in_ch}"
+    
+
+    # Now test realtime replication to verify versions continue correctly
+    # Start binlog replication
+    binlog_replicator_runner = BinlogReplicatorRunner(cfg_file=cfg_file)
+    binlog_replicator_runner.run()
+
+    time.sleep(3.0)
+    
+    # Start DB replicator in realtime mode
+    realtime_db_replicator = DbReplicatorRunner(TEST_DB_NAME, cfg_file=cfg_file)
+    realtime_db_replicator.run()
+    
+    # Insert a new record with version 1001
+    mysql.execute(
+        f"INSERT INTO `{TEST_TABLE_NAME}` (name, age, version) VALUES ('UserRealtime', 99, 1001);", 
+        commit=True
+    )
+    
+    # Wait for the record to be replicated
+    assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == 1001)
+    
+    # Verify the new record was replicated correctly
+    realtime_record = ch.select(TEST_TABLE_NAME, where="name='UserRealtime'")[0]
+    assert realtime_record['age'] == 99
+    assert realtime_record['version'] == 1001
+    
+    # Check that the _version column in CH is a reasonable value
+    # With parallel workers, the _version won't be > 1000 because each worker
+    # has its own independent version counter and they never intersect
+    versions_query = ch.query(f"SELECT _version FROM `{TEST_DB_NAME}`.`{TEST_TABLE_NAME}` WHERE name='UserRealtime'")
+    ch_version = versions_query.result_rows[0][0]
+
+
+    # With parallel workers (default is 4), each worker would process ~250 records
+    # So the version for the new record should be slightly higher than 250
+    # but definitely lower than 1000
+    assert ch_version > 0, f"ClickHouse _version should be > 0, but got {ch_version}"
+    
+    # We expect version to be roughly: (total_records / num_workers) + 1
+    # For 1000 records and 4 workers, expect around 251
+    expected_version_approx = 1000 // cfg.initial_replication_threads + 1
+    # Allow some flexibility in the exact expected value
+    assert abs(ch_version - expected_version_approx) < 50, (
+        f"ClickHouse _version should be close to {expected_version_approx}, but got {ch_version}"
+    )
+    
+    # Clean up
+    binlog_replicator_runner.stop()
+    realtime_db_replicator.stop()
+    db_replicator_runner.stop()
+
+
 def test_database_tables_filtering():
     cfg = config.Settings()
     cfg.load('tests_config_databases_tables.yaml')
@@ -688,8 +816,8 @@ CREATE TABLE `{TEST_TABLE_NAME}` (
     name varchar(255),
     modified_date DateTime(3) NOT NULL,
     test_date date NOT NULL,
-    PRIMARY KEY (id)
-); 
+        PRIMARY KEY (id)
+    );
     ''')
 
     mysql.execute(
@@ -726,88 +854,6 @@ CREATE TABLE `{TEST_TABLE_NAME}` (
 
     db_replicator_runner.stop()
     binlog_replicator_runner.stop()
-
-
-def test_performance():
-    config_file = 'tests_config_perf.yaml'
-    num_records = 100000
-
-    cfg = config.Settings()
-    cfg.load(config_file)
-
-    mysql = mysql_api.MySQLApi(
-        database=None,
-        mysql_settings=cfg.mysql,
-    )
-
-    ch = clickhouse_api.ClickhouseApi(
-        database=TEST_DB_NAME,
-        clickhouse_settings=cfg.clickhouse,
-    )
-
-    prepare_env(cfg, mysql, ch)
-
-    mysql.execute(f'''
-    CREATE TABLE `{TEST_TABLE_NAME}` (
-        id int NOT NULL AUTO_INCREMENT,
-        name varchar(2048),
-        age int,
-        PRIMARY KEY (id)
-    ); 
-        ''')
-
-    binlog_replicator_runner = BinlogReplicatorRunner(cfg_file=config_file)
-    binlog_replicator_runner.run()
-
-    time.sleep(1)
-
-    mysql.execute(f"INSERT INTO `{TEST_TABLE_NAME}` (name, age) VALUES ('TEST_VALUE_1', 33);", commit=True)
-
-    def _get_last_insert_name():
-        record = get_last_insert_from_binlog(cfg=cfg, db_name=TEST_DB_NAME)
-        if record is None:
-            return None
-        return record[1].decode('utf-8')
-
-    assert_wait(lambda: _get_last_insert_name() == 'TEST_VALUE_1', retry_interval=0.5)
-
-    binlog_replicator_runner.stop()
-
-    time.sleep(1)
-
-    print("populating mysql data")
-
-    base_value = 'a' * 2000
-
-    for i in range(num_records):
-        if i % 2000 == 0:
-            print(f'populated {i} elements')
-        mysql.execute(
-            f"INSERT INTO `{TEST_TABLE_NAME}` (name, age) "
-            f"VALUES ('TEST_VALUE_{i}_{base_value}', {i});", commit=i % 20 == 0,
-        )
-#`replication-test_db`
-    mysql.execute(f"INSERT INTO `{TEST_TABLE_NAME}` (name, age) VALUES ('TEST_VALUE_FINAL', 0);", commit=True)
-
-    print("running db_replicator")
-    t1 = time.time()
-    binlog_replicator_runner = BinlogReplicatorRunner(cfg_file=config_file)
-    binlog_replicator_runner.run()
-
-    assert_wait(lambda: _get_last_insert_name() == 'TEST_VALUE_FINAL', retry_interval=0.5, max_wait_time=1000)
-    t2 = time.time()
-
-    binlog_replicator_runner.stop()
-
-    time_delta = t2 - t1
-    rps = num_records / time_delta
-
-    print('\n\n')
-    print("*****************************")
-    print("records per second:", int(rps))
-    print("total time (seconds):", round(time_delta, 2))
-    print("*****************************")
-    print('\n\n')
 
 
 
@@ -1126,7 +1172,7 @@ CREATE TABLE `{TEST_TABLE_NAME}` (
 
 
 def test_string_primary_key(monkeypatch):
-    monkeypatch.setattr(DbReplicator, 'INITIAL_REPLICATION_BATCH_SIZE', 1)
+    monkeypatch.setattr(DbReplicatorInitial, 'INITIAL_REPLICATION_BATCH_SIZE', 1)
 
     cfg = config.Settings()
     cfg.load(CONFIG_FILE)
@@ -1188,7 +1234,7 @@ CREATE TABLE `{TEST_TABLE_NAME}` (
 
 
 def test_if_exists_if_not_exists(monkeypatch):
-    monkeypatch.setattr(DbReplicator, 'INITIAL_REPLICATION_BATCH_SIZE', 1)
+    monkeypatch.setattr(DbReplicatorInitial, 'INITIAL_REPLICATION_BATCH_SIZE', 1)
 
     cfg = config.Settings()
     cfg.load(CONFIG_FILE)
@@ -1229,7 +1275,7 @@ def test_if_exists_if_not_exists(monkeypatch):
 
 
 def test_percona_migration(monkeypatch):
-    monkeypatch.setattr(DbReplicator, 'INITIAL_REPLICATION_BATCH_SIZE', 1)
+    monkeypatch.setattr(DbReplicatorInitial, 'INITIAL_REPLICATION_BATCH_SIZE', 1)
 
     cfg = config.Settings()
     cfg.load(CONFIG_FILE)
@@ -1307,7 +1353,7 @@ CREATE TABLE `{TEST_DB_NAME}`.`_{TEST_TABLE_NAME}_new` (
 
 
 def test_add_column_first_after_and_drop_column(monkeypatch):
-    monkeypatch.setattr(DbReplicator, 'INITIAL_REPLICATION_BATCH_SIZE', 1)
+    monkeypatch.setattr(DbReplicatorInitial, 'INITIAL_REPLICATION_BATCH_SIZE', 1)
 
     cfg = config.Settings()
     cfg.load(CONFIG_FILE)
@@ -1439,7 +1485,7 @@ def get_last_insert_from_binlog(cfg: config.Settings, db_name: str):
 
 
 @pytest.mark.optional
-def test_performance_dbreplicator():
+def test_performance_realtime_replication():
     config_file = 'tests_config_perf.yaml'
     num_records = 100000
 
@@ -1469,6 +1515,8 @@ def test_performance_dbreplicator():
 
     binlog_replicator_runner = BinlogReplicatorRunner(cfg_file=config_file)
     binlog_replicator_runner.run()
+    db_replicator_runner = DbReplicatorRunner(TEST_DB_NAME, cfg_file=config_file)
+    db_replicator_runner.run()
 
     time.sleep(1)
 
@@ -1481,8 +1529,15 @@ def test_performance_dbreplicator():
         return record[1].decode('utf-8')
 
     assert_wait(lambda: _get_last_insert_name() == 'TEST_VALUE_1', retry_interval=0.5)
+    
+    # Wait for the database and table to be created in ClickHouse
+    assert_wait(lambda: TEST_DB_NAME in ch.get_databases(), retry_interval=0.5)
+    ch.execute_command(f'USE `{TEST_DB_NAME}`')
+    assert_wait(lambda: TEST_TABLE_NAME in ch.get_tables(), retry_interval=0.5)
+    assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == 1, retry_interval=0.5)
 
     binlog_replicator_runner.stop()
+    db_replicator_runner.stop()
 
     time.sleep(1)
 
@@ -1500,7 +1555,7 @@ def test_performance_dbreplicator():
 
     mysql.execute(f"INSERT INTO `{TEST_TABLE_NAME}` (name, age) VALUES ('TEST_VALUE_FINAL', 0);", commit=True)
 
-    print("running db_replicator")
+    print("running binlog_replicator")
     t1 = time.time()
     binlog_replicator_runner = BinlogReplicatorRunner(cfg_file=config_file)
     binlog_replicator_runner.run()
@@ -1515,6 +1570,33 @@ def test_performance_dbreplicator():
 
     print('\n\n')
     print("*****************************")
+    print("Binlog Replicator Performance:")
+    print("records per second:", int(rps))
+    print("total time (seconds):", round(time_delta, 2))
+    print("*****************************")
+    print('\n\n')
+
+    # Now test db_replicator performance
+    print("running db_replicator")
+    t1 = time.time()
+    db_replicator_runner = DbReplicatorRunner(TEST_DB_NAME, cfg_file=config_file)
+    db_replicator_runner.run()
+
+    # Make sure the database and table exist before querying
+    assert_wait(lambda: TEST_DB_NAME in ch.get_databases(), retry_interval=0.5)
+    ch.execute_command(f'USE `{TEST_DB_NAME}`')
+    assert_wait(lambda: TEST_TABLE_NAME in ch.get_tables(), retry_interval=0.5)
+    assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == num_records + 2, retry_interval=0.5, max_wait_time=1000)
+    t2 = time.time()
+
+    db_replicator_runner.stop()
+
+    time_delta = t2 - t1
+    rps = num_records / time_delta
+
+    print('\n\n')
+    print("*****************************")
+    print("DB Replicator Performance:")
     print("records per second:", int(rps))
     print("total time (seconds):", round(time_delta, 2))
     print("*****************************")
@@ -1620,6 +1702,149 @@ def test_enum_conversion():
     assert_wait(lambda: 'stopping db_replicator' in read_logs(TEST_DB_NAME))
     assert('Traceback' not in read_logs(TEST_DB_NAME))
     
+
+def test_polygon_type():
+    """
+    Test that polygon type is properly converted and handled between MySQL and ClickHouse.
+    Tests both the type conversion and data handling for polygon values.
+    """
+    config_file = CONFIG_FILE
+    cfg = config.Settings()
+    cfg.load(config_file)
+    mysql_config = cfg.mysql
+    clickhouse_config = cfg.clickhouse
+    mysql = mysql_api.MySQLApi(
+        database=None,
+        mysql_settings=mysql_config
+    )
+    ch = clickhouse_api.ClickhouseApi(
+        database=TEST_DB_NAME,
+        clickhouse_settings=clickhouse_config
+    )
+
+    prepare_env(cfg, mysql, ch)
+
+    # Create a table with polygon type
+    mysql.execute(f'''
+    CREATE TABLE `{TEST_TABLE_NAME}` (
+        id INT NOT NULL AUTO_INCREMENT,
+        name VARCHAR(50) NOT NULL,
+        area POLYGON NOT NULL,
+        nullable_area POLYGON,
+        PRIMARY KEY (id)
+    )
+    ''')
+
+    # Insert test data with polygons
+    # Using ST_GeomFromText to create polygons from WKT (Well-Known Text) format
+    mysql.execute(f'''
+    INSERT INTO `{TEST_TABLE_NAME}` (name, area, nullable_area) VALUES 
+    ('Square', ST_GeomFromText('POLYGON((0 0, 0 1, 1 1, 1 0, 0 0))'), ST_GeomFromText('POLYGON((0 0, 0 2, 2 2, 2 0, 0 0))')),
+    ('Triangle', ST_GeomFromText('POLYGON((0 0, 1 0, 0.5 1, 0 0))'), NULL),
+    ('Complex', ST_GeomFromText('POLYGON((0 0, 0 3, 3 3, 3 0, 0 0))'), ST_GeomFromText('POLYGON((1 1, 1 2, 2 2, 2 1, 1 1))'));
+    ''', commit=True)
+
+    run_all_runner = RunAllRunner(cfg_file=config_file)
+    run_all_runner.run()
+
+    assert_wait(lambda: TEST_DB_NAME in ch.get_databases())
+    ch.execute_command(f'USE `{TEST_DB_NAME}`')
+    assert_wait(lambda: TEST_TABLE_NAME in ch.get_tables())
+    assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == 3)
+
+    # Get the ClickHouse data
+    results = ch.select(TEST_TABLE_NAME)
+    
+    # Verify the data
+    assert len(results) == 3
+    
+    # Check first row (Square)
+    assert results[0]['name'] == 'Square'
+    assert len(results[0]['area']) == 5  # Square has 5 points (including closing point)
+    assert len(results[0]['nullable_area']) == 5
+    # Verify some specific points
+    assert results[0]['area'][0] == {'x': 0.0, 'y': 0.0}
+    assert results[0]['area'][1] == {'x': 0.0, 'y': 1.0}
+    assert results[0]['area'][2] == {'x': 1.0, 'y': 1.0}
+    assert results[0]['area'][3] == {'x': 1.0, 'y': 0.0}
+    assert results[0]['area'][4] == {'x': 0.0, 'y': 0.0}  # Closing point
+    
+    # Check second row (Triangle)
+    assert results[1]['name'] == 'Triangle'
+    assert len(results[1]['area']) == 4  # Triangle has 4 points (including closing point)
+    assert results[1]['nullable_area'] == []  # NULL values are returned as empty list
+    # Verify some specific points
+    assert results[1]['area'][0] == {'x': 0.0, 'y': 0.0}
+    assert results[1]['area'][1] == {'x': 1.0, 'y': 0.0}
+    assert results[1]['area'][2] == {'x': 0.5, 'y': 1.0}
+    assert results[1]['area'][3] == {'x': 0.0, 'y': 0.0}  # Closing point
+    
+    # Check third row (Complex)
+    assert results[2]['name'] == 'Complex'
+    assert len(results[2]['area']) == 5  # Outer square
+    assert len(results[2]['nullable_area']) == 5  # Inner square
+    # Verify some specific points
+    assert results[2]['area'][0] == {'x': 0.0, 'y': 0.0}
+    assert results[2]['area'][2] == {'x': 3.0, 'y': 3.0}
+    assert results[2]['nullable_area'][0] == {'x': 1.0, 'y': 1.0}
+    assert results[2]['nullable_area'][2] == {'x': 2.0, 'y': 2.0}
+
+    # Test realtime replication by adding more records
+    mysql.execute(f'''
+    INSERT INTO `{TEST_TABLE_NAME}` (name, area, nullable_area) VALUES 
+    ('Pentagon', ST_GeomFromText('POLYGON((0 0, 1 0, 1.5 1, 0.5 1.5, 0 0))'), ST_GeomFromText('POLYGON((0.2 0.2, 0.8 0.2, 1 0.8, 0.5 1, 0.2 0.2))')),
+    ('Hexagon', ST_GeomFromText('POLYGON((0 0, 1 0, 1.5 0.5, 1 1, 0.5 1, 0 0))'), NULL),
+    ('Circle', ST_GeomFromText('POLYGON((0 0, 0 2, 2 2, 2 0, 0 0))'), ST_GeomFromText('POLYGON((0.5 0.5, 0.5 1.5, 1.5 1.5, 1.5 0.5, 0.5 0.5))'));
+    ''', commit=True)
+
+    # Wait for new records to be replicated
+    assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == 6)
+
+    # Verify the new records using WHERE clauses
+    # Check Pentagon
+    pentagon = ch.select(TEST_TABLE_NAME, where="name='Pentagon'")[0]
+    assert pentagon['name'] == 'Pentagon'
+    assert len(pentagon['area']) == 5  # Pentagon has 5 points
+    assert len(pentagon['nullable_area']) == 5  # Inner pentagon
+    assert abs(pentagon['area'][0]['x'] - 0.0) < 1e-6
+    assert abs(pentagon['area'][0]['y'] - 0.0) < 1e-6
+    assert abs(pentagon['area'][2]['x'] - 1.5) < 1e-6
+    assert abs(pentagon['area'][2]['y'] - 1.0) < 1e-6
+    assert abs(pentagon['nullable_area'][0]['x'] - 0.2) < 1e-6
+    assert abs(pentagon['nullable_area'][0]['y'] - 0.2) < 1e-6
+    assert abs(pentagon['nullable_area'][2]['x'] - 1.0) < 1e-6
+    assert abs(pentagon['nullable_area'][2]['y'] - 0.8) < 1e-6
+    
+    # Check Hexagon
+    hexagon = ch.select(TEST_TABLE_NAME, where="name='Hexagon'")[0]
+    assert hexagon['name'] == 'Hexagon'
+    assert len(hexagon['area']) == 6  # Hexagon has 6 points
+    assert hexagon['nullable_area'] == []  # NULL values are returned as empty list
+    assert abs(hexagon['area'][0]['x'] - 0.0) < 1e-6
+    assert abs(hexagon['area'][0]['y'] - 0.0) < 1e-6
+    assert abs(hexagon['area'][2]['x'] - 1.5) < 1e-6
+    assert abs(hexagon['area'][2]['y'] - 0.5) < 1e-6
+    assert abs(hexagon['area'][4]['x'] - 0.5) < 1e-6
+    assert abs(hexagon['area'][4]['y'] - 1.0) < 1e-6
+    
+    # Check Circle
+    circle = ch.select(TEST_TABLE_NAME, where="name='Circle'")[0]
+    assert circle['name'] == 'Circle'
+    assert len(circle['area']) == 5  # Outer square
+    assert len(circle['nullable_area']) == 5  # Inner square
+    assert abs(circle['area'][0]['x'] - 0.0) < 1e-6
+    assert abs(circle['area'][0]['y'] - 0.0) < 1e-6
+    assert abs(circle['area'][2]['x'] - 2.0) < 1e-6
+    assert abs(circle['area'][2]['y'] - 2.0) < 1e-6
+    assert abs(circle['nullable_area'][0]['x'] - 0.5) < 1e-6
+    assert abs(circle['nullable_area'][0]['y'] - 0.5) < 1e-6
+    assert abs(circle['nullable_area'][2]['x'] - 1.5) < 1e-6
+    assert abs(circle['nullable_area'][2]['y'] - 1.5) < 1e-6
+
+    run_all_runner.stop()
+    assert_wait(lambda: 'stopping db_replicator' in read_logs(TEST_DB_NAME))
+    assert('Traceback' not in read_logs(TEST_DB_NAME))
+
 @pytest.mark.parametrize("query,expected", [
     ("CREATE TABLE `mydb`.`mytable` (id INT)", "mydb"),
     ("CREATE TABLE mydb.mytable (id INT)", "mydb"),
@@ -1657,3 +1882,378 @@ def test_enum_conversion():
 ])
 def test_parse_db_name_from_query(query, expected):
     assert BinlogReplicator._try_parse_db_name_from_query(query) == expected
+
+
+def test_create_table_like():
+    """
+    Test that CREATE TABLE ... LIKE statements are handled correctly.
+    The test creates a source table, then creates another table using LIKE,
+    and verifies that both tables have the same structure in ClickHouse.
+    """
+    config_file = CONFIG_FILE
+    cfg = config.Settings()
+    cfg.load(config_file)
+
+    mysql = mysql_api.MySQLApi(
+        database=None,
+        mysql_settings=cfg.mysql,
+    )
+
+    ch = clickhouse_api.ClickhouseApi(
+        database=TEST_DB_NAME,
+        clickhouse_settings=cfg.clickhouse,
+    )
+
+    prepare_env(cfg, mysql, ch)
+    mysql.set_database(TEST_DB_NAME)
+
+    # Create the source table with a complex structure
+    mysql.execute(f'''
+    CREATE TABLE `source_table` (
+        id INT NOT NULL AUTO_INCREMENT,
+        name VARCHAR(255) NOT NULL,
+        age INT UNSIGNED,
+        email VARCHAR(100) UNIQUE,
+        status ENUM('active','inactive','pending') DEFAULT 'active',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        data JSON,
+        PRIMARY KEY (id)
+    );
+    ''')
+    
+    # Get the CREATE statement for the source table
+    source_create = mysql.get_table_create_statement('source_table')
+    
+    # Create a table using LIKE statement
+    mysql.execute(f'''
+    CREATE TABLE `derived_table` LIKE `source_table`;
+    ''')
+
+    # Set up replication
+    binlog_replicator_runner = BinlogReplicatorRunner(cfg_file=config_file)
+    binlog_replicator_runner.run()
+    db_replicator_runner = DbReplicatorRunner(TEST_DB_NAME, cfg_file=config_file)
+    db_replicator_runner.run()
+
+    # Wait for database to be created and renamed from tmp to final
+    assert_wait(lambda: TEST_DB_NAME in ch.get_databases(), max_wait_time=10.0)
+    
+    # Use the correct database explicitly
+    ch.execute_command(f'USE `{TEST_DB_NAME}`')
+
+    # Wait for tables to be created in ClickHouse with a longer timeout
+    assert_wait(lambda: 'source_table' in ch.get_tables(), max_wait_time=10.0)
+    assert_wait(lambda: 'derived_table' in ch.get_tables(), max_wait_time=10.0)
+
+    # Insert data into both tables to verify they work
+    mysql.execute("INSERT INTO `source_table` (name, age, email, status) VALUES ('Alice', 30, 'alice@example.com', 'active');", commit=True)
+    mysql.execute("INSERT INTO `derived_table` (name, age, email, status) VALUES ('Bob', 25, 'bob@example.com', 'pending');", commit=True)
+
+    # Wait for data to be replicated
+    assert_wait(lambda: len(ch.select('source_table')) == 1, max_wait_time=10.0)
+    assert_wait(lambda: len(ch.select('derived_table')) == 1, max_wait_time=10.0)
+
+    # Compare structures by reading descriptions in ClickHouse
+    source_desc = ch.execute_command("DESCRIBE TABLE source_table")
+    derived_desc = ch.execute_command("DESCRIBE TABLE derived_table")
+
+    # The structures should be identical
+    assert source_desc == derived_desc
+    
+    # Verify the data in both tables
+    source_data = ch.select('source_table')[0]
+    derived_data = ch.select('derived_table')[0]
+    
+    assert source_data['name'] == 'Alice'
+    assert derived_data['name'] == 'Bob'
+    
+    # Both tables should have same column types
+    assert type(source_data['id']) == type(derived_data['id'])
+    assert type(source_data['name']) == type(derived_data['name'])
+    assert type(source_data['age']) == type(derived_data['age'])
+    
+    # Now test realtime replication by creating a new table after the initial replication
+    mysql.execute(f'''
+    CREATE TABLE `realtime_table` (
+        id INT NOT NULL AUTO_INCREMENT,
+        title VARCHAR(100) NOT NULL,
+        description TEXT,
+        price DECIMAL(10,2),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id)
+    );
+    ''')
+    
+    # Wait for the new table to be created in ClickHouse
+    assert_wait(lambda: 'realtime_table' in ch.get_tables(), max_wait_time=10.0)
+    
+    # Insert data into the new table
+    mysql.execute("""
+    INSERT INTO `realtime_table` (title, description, price) VALUES 
+    ('Product 1', 'First product description', 19.99),
+    ('Product 2', 'Second product description', 29.99),
+    ('Product 3', 'Third product description', 39.99);
+    """, commit=True)
+    
+    # Wait for data to be replicated
+    assert_wait(lambda: len(ch.select('realtime_table')) == 3, max_wait_time=10.0)
+    
+    # Verify the data in the realtime table
+    realtime_data = ch.select('realtime_table')
+    assert len(realtime_data) == 3
+    
+    # Verify specific values
+    products = sorted([record['title'] for record in realtime_data])
+    assert products == ['Product 1', 'Product 2', 'Product 3']
+    
+    prices = sorted([float(record['price']) for record in realtime_data])
+    assert prices == [19.99, 29.99, 39.99]
+    
+    # Now create another table using LIKE after initial replication
+    mysql.execute(f'''
+    CREATE TABLE `realtime_like_table` LIKE `realtime_table`;
+    ''')
+    
+    # Wait for the new LIKE table to be created in ClickHouse
+    assert_wait(lambda: 'realtime_like_table' in ch.get_tables(), max_wait_time=10.0)
+    
+    # Insert data into the new LIKE table
+    mysql.execute("""
+    INSERT INTO `realtime_like_table` (title, description, price) VALUES 
+    ('Service A', 'Premium service', 99.99),
+    ('Service B', 'Standard service', 49.99);
+    """, commit=True)
+    
+    # Wait for data to be replicated
+    assert_wait(lambda: len(ch.select('realtime_like_table')) == 2, max_wait_time=10.0)
+    
+    # Verify the data in the realtime LIKE table
+    like_data = ch.select('realtime_like_table')
+    assert len(like_data) == 2
+    
+    services = sorted([record['title'] for record in like_data])
+    assert services == ['Service A', 'Service B']
+    
+    # Clean up
+    db_replicator_runner.stop()
+    binlog_replicator_runner.stop()
+
+
+def test_year_type():
+    """
+    Test that MySQL YEAR type is properly converted to UInt16 in ClickHouse
+    and that year values are correctly handled.
+    """
+    config_file = CONFIG_FILE
+    cfg = config.Settings()
+    cfg.load(config_file)
+    mysql_config = cfg.mysql
+    clickhouse_config = cfg.clickhouse
+    mysql = mysql_api.MySQLApi(
+        database=None,
+        mysql_settings=mysql_config
+    )
+    ch = clickhouse_api.ClickhouseApi(
+        database=TEST_DB_NAME,
+        clickhouse_settings=clickhouse_config
+    )
+
+    prepare_env(cfg, mysql, ch)
+
+    mysql.execute(f'''
+    CREATE TABLE `{TEST_TABLE_NAME}` (
+        id INT NOT NULL AUTO_INCREMENT,
+        year_field YEAR NOT NULL,
+        nullable_year YEAR,
+        PRIMARY KEY (id)
+    )
+    ''')
+
+    # Insert test data with various year values
+    mysql.execute(f'''
+    INSERT INTO `{TEST_TABLE_NAME}` (year_field, nullable_year) VALUES 
+    (2024, 2024),
+    (1901, NULL),
+    (2155, 2000),
+    (2000, 1999);
+    ''', commit=True)
+
+    run_all_runner = RunAllRunner(cfg_file=config_file)
+    run_all_runner.run()
+
+    assert_wait(lambda: TEST_DB_NAME in ch.get_databases())
+    ch.execute_command(f'USE `{TEST_DB_NAME}`')
+    assert_wait(lambda: TEST_TABLE_NAME in ch.get_tables())
+    assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == 4)
+
+    # Get the ClickHouse data
+    results = ch.select(TEST_TABLE_NAME)
+    
+    # Verify the data
+    assert results[0]['year_field'] == 2024
+    assert results[0]['nullable_year'] == 2024
+    assert results[1]['year_field'] == 1901
+    assert results[1]['nullable_year'] is None
+    assert results[2]['year_field'] == 2155
+    assert results[2]['nullable_year'] == 2000
+    assert results[3]['year_field'] == 2000
+    assert results[3]['nullable_year'] == 1999
+
+    # Test realtime replication by adding more records
+    mysql.execute(f'''
+    INSERT INTO `{TEST_TABLE_NAME}` (year_field, nullable_year) VALUES 
+    (2025, 2025),
+    (1999, NULL),
+    (2100, 2100);
+    ''', commit=True)
+
+    # Wait for new records to be replicated
+    assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == 7)
+
+    # Verify the new records - include order by in the where clause
+    new_results = ch.select(TEST_TABLE_NAME, where="year_field >= 2025 ORDER BY year_field ASC")
+    assert len(new_results) == 3
+    
+    # Check specific values
+    assert new_results[0]['year_field'] == 2025
+    assert new_results[0]['nullable_year'] == 2025
+    assert new_results[1]['year_field'] == 2100
+    assert new_results[1]['nullable_year'] == 2100
+    assert new_results[2]['year_field'] == 2155
+    assert new_results[2]['nullable_year'] == 2000
+
+    run_all_runner.stop()
+    assert_wait(lambda: 'stopping db_replicator' in read_logs(TEST_DB_NAME))
+    assert('Traceback' not in read_logs(TEST_DB_NAME))
+
+
+@pytest.mark.optional
+def test_performance_initial_only_replication():
+    config_file = 'tests_config_perf.yaml'
+    num_records = 300000
+
+    cfg = config.Settings()
+    cfg.load(config_file)
+
+    mysql = mysql_api.MySQLApi(
+        database=None,
+        mysql_settings=cfg.mysql,
+    )
+
+    ch = clickhouse_api.ClickhouseApi(
+        database=TEST_DB_NAME,
+        clickhouse_settings=cfg.clickhouse,
+    )
+
+    prepare_env(cfg, mysql, ch)
+
+    mysql.execute(f'''
+    CREATE TABLE `{TEST_TABLE_NAME}` (
+        id int NOT NULL AUTO_INCREMENT,
+        name varchar(2048),
+        age int,
+        PRIMARY KEY (id)
+    ); 
+    ''')
+
+    print("populating mysql data")
+
+    base_value = 'a' * 2000
+
+    for i in range(num_records):
+        if i % 2000 == 0:
+            print(f'populated {i} elements')
+        mysql.execute(
+            f"INSERT INTO `{TEST_TABLE_NAME}` (name, age) "
+            f"VALUES ('TEST_VALUE_{i}_{base_value}', {i});", commit=i % 20 == 0,
+        )
+
+    mysql.execute(f"INSERT INTO `{TEST_TABLE_NAME}` (name, age) VALUES ('TEST_VALUE_FINAL', 0);", commit=True)
+    print(f"finished populating {num_records} records")
+
+    # Now test db_replicator performance in initial_only mode
+    print("running db_replicator in initial_only mode")
+    t1 = time.time()
+    
+    db_replicator_runner = DbReplicatorRunner(
+        TEST_DB_NAME, 
+        additional_arguments='--initial_only=True',
+        cfg_file=config_file
+    )
+    db_replicator_runner.run()
+    db_replicator_runner.wait_complete()  # Wait for the process to complete
+
+    # Make sure the database and table exist
+    assert_wait(lambda: TEST_DB_NAME in ch.get_databases(), retry_interval=0.5)
+    ch.execute_command(f'USE `{TEST_DB_NAME}`')
+    assert_wait(lambda: TEST_TABLE_NAME in ch.get_tables(), retry_interval=0.5)
+    
+    # Check that all records were replicated
+    assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == num_records + 1, retry_interval=0.5, max_wait_time=300)
+    
+    t2 = time.time()
+
+    time_delta = t2 - t1
+    rps = num_records / time_delta
+
+    print('\n\n')
+    print("*****************************")
+    print("DB Replicator Initial Only Mode Performance:")
+    print("records per second:", int(rps))
+    print("total time (seconds):", round(time_delta, 2))
+    print("*****************************")
+    print('\n\n')
+    
+    # Clean up
+    ch.drop_database(TEST_DB_NAME)
+    
+    # Now test with parallel replication
+    # Set initial_replication_threads in the config
+    print("running db_replicator with parallel initial replication")
+    
+    t1 = time.time()
+    
+    # Create a custom config file for testing with parallel replication
+    parallel_config_file = 'tests_config_perf_parallel.yaml'
+    if os.path.exists(parallel_config_file):
+        os.remove(parallel_config_file)
+
+    with open(config_file, 'r') as src_file:
+        config_content = src_file.read()
+    config_content += f"\ninitial_replication_threads: 8\n"
+    with open(parallel_config_file, 'w') as dest_file:
+        dest_file.write(config_content)
+    
+    # Use the DbReplicator directly to test the new parallel implementation
+    db_replicator_runner = DbReplicatorRunner(
+        TEST_DB_NAME, 
+        cfg_file=parallel_config_file
+    )
+    db_replicator_runner.run()
+    
+    # Make sure the database and table exist
+    assert_wait(lambda: TEST_DB_NAME in ch.get_databases(), retry_interval=0.5)
+    ch.execute_command(f'USE `{TEST_DB_NAME}`')
+    assert_wait(lambda: TEST_TABLE_NAME in ch.get_tables(), retry_interval=0.5)
+    
+    # Check that all records were replicated
+    assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == num_records + 1, retry_interval=0.5, max_wait_time=300)
+    
+    t2 = time.time()
+    
+    time_delta = t2 - t1
+    rps = num_records / time_delta
+    
+    print('\n\n')
+    print("*****************************")
+    print("DB Replicator Parallel Mode Performance:")
+    print("workers:", cfg.initial_replication_threads)
+    print("records per second:", int(rps))
+    print("total time (seconds):", round(time_delta, 2))
+    print("*****************************")
+    print('\n\n')
+    
+    db_replicator_runner.stop()
+    
+    # Clean up the temporary config file
+    os.remove(parallel_config_file)

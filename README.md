@@ -15,6 +15,27 @@
 
 With a focus on high performance, it utilizes batching heavily and uses C++ extension for faster execution. This tool ensures seamless data integration with support for migrations, schema changes, and correct data management.
 
+## Table of Contents
+- [Features](#features)
+- [Installation](#installation)
+  - [Requirements](#requirements)
+  - [Installation](#installation-1)
+  - [Docker Installation](#docker-installation)
+- [Usage](#usage)
+  - [Basic Usage](#basic-usage)
+  - [One Time Data Copy](#one-time-data-copy)
+  - [Configuration](#configuration)
+    - [Required settings](#required-settings)
+    - [Optional settings](#optional-settings)
+  - [Advanced Features](#advanced-features)
+    - [Migrations & Schema Changes](#migrations--schema-changes)
+    - [Recovery Without Downtime](#recovery-without-downtime)
+- [Development](#development)
+  - [Running Tests](#running-tests)
+- [Contribution](#contribution)
+- [License](#license)
+- [Acknowledgements](#acknowledgements)
+
 ## Features
 
 - **Real-Time Replication**: Keeps your ClickHouse database in sync with MySQL in real-time.
@@ -39,6 +60,29 @@ pip install mysql_ch_replicator
 ```
 
 You may need to also compile C++ components if they're not pre-built for your platform.
+
+### Docker Installation
+
+Alternatively, you can use the pre-built Docker image from DockerHub:
+
+```bash
+docker pull fippo/mysql-ch-replicator:latest
+```
+
+To run the container:
+
+```bash
+docker run -d \
+  -v /path/to/your/config.yaml:/app/config.yaml \
+  -v /path/to/your/data:/app/data \
+  fippo/mysql-ch-replicator:latest \
+  --config /app/config.yaml run_all
+```
+
+Make sure to:
+1. Mount your configuration file using the `-v` flag
+2. Mount a persistent volume for the data directory
+3. Adjust the paths according to your setup
 
 ## Usage
 
@@ -148,12 +192,15 @@ clickhouse:
 binlog_replicator:
   data_dir: '/home/user/binlog/'
   records_per_file: 100000
+  binlog_retention_period: 43200  # optional, how long to keep binlog files in seconds, default 12 hours
 
 databases: 'database_name_pattern_*'
 tables: '*'
 
 
 # OPTIONAL SETTINGS
+
+initial_replication_threads: 4                        # optional
 
 exclude_databases: ['database_10', 'database_*_42']   # optional
 exclude_tables: ['meta_table_*']                      # optional
@@ -189,6 +236,7 @@ types_mapping:          # optional
 - `databases` Databases name pattern to replicate, e.g. `db_*` will match `db_1` `db_2` `db_test`, list is also supported
 
 #### Optional settings
+- `initial_replication_threads` - number of threads for initial replication, by default 1, set it to number of cores to accelerate initial data copy
 - `tables` - tables to filter, list is also supported
 - `exclude_databases` - databases to __exclude__, string or list, eg `'table1*'` or `['table2', 'table3*']`. If same database matches `databases` and `exclude_databases`, exclude has higher priority.
 - `exclude_tables` - databases to __exclude__, string or list. If same table matches `tables` and `exclude_tables`, exclude has higher priority.
@@ -196,6 +244,7 @@ types_mapping:          # optional
 - `log_level` - log level, default is `info`, you can set to `debug` to get maximum information (allowed values are `debug`, `info`, `warning`, `error`, `critical`)
 - `optimize_interval` - interval (seconds) between automatic `OPTIMIZE table FINAL` calls. Default 86400 (1 day). This is required to perform all merges guaranteed and avoid increasing of used storage and decreasing performance.
 - `auto_restart_interval` - interval (seconds) between automatic db_replicator restart. Default 3600 (1 hour). This is done to reduce memory usage.
+- `binlog_retention_period` - how long to keep binlog files in seconds. Default 43200 (12 hours). This setting controls how long the local binlog files are retained before being automatically cleaned up.
 - `indexes` - you may want to add some indexes to accelerate performance, eg. ngram index for full-test search, etc. To apply indexes you need to start replication from scratch.
 - `http_host`, `http_port` - http endpoint to control replication, use `/docs` for abailable commands
 - `types_mappings` - custom types mapping, eg. you can map char(36) to UUID instead of String, etc.
