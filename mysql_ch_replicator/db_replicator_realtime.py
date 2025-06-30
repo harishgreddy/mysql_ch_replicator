@@ -148,6 +148,17 @@ class DbReplicatorRealtime:
                 f'table: {event.table_name}, '
                 f'records: {event.records}',
             )
+        
+        # If ignore_deletes is enabled, skip processing delete events
+        if self.replicator.config.ignore_deletes:
+            if self.replicator.config.debug_log_level:
+                logger.debug(
+                    f'ignoring erase event (ignore_deletes=True): {event.transaction_id}, '
+                    f'table: {event.table_name}, '
+                    f'records: {len(event.records)}',
+                )
+            return
+            
         self.replicator.stats.erase_events_count += 1
         self.replicator.stats.erase_records_count += len(event.records)
 
@@ -180,6 +191,9 @@ class DbReplicatorRealtime:
         if query.lower().startswith('rename table'):
             self.upload_records()
             self.handle_rename_table_query(query, event.db_name)
+        if query.lower().startswith('truncate'):
+            self.upload_records()
+            self.handle_truncate_query(query, event.db_name)
 
     def handle_alter_query(self, query, db_name):
         self.replicator.converter.convert_alter_query(query, db_name)
@@ -190,7 +204,8 @@ class DbReplicatorRealtime:
             return
         self.replicator.state.tables_structure[mysql_structure.table_name] = (mysql_structure, ch_structure)
         indexes = self.replicator.config.get_indexes(self.replicator.database, ch_structure.table_name)
-        self.replicator.clickhouse_api.create_table(ch_structure, additional_indexes=indexes)
+        partition_bys = self.replicator.config.get_partition_bys(self.replicator.database, ch_structure.table_name)
+        self.replicator.clickhouse_api.create_table(ch_structure, additional_indexes=indexes, additional_partition_bys=partition_bys)
 
     def handle_drop_table_query(self, query, db_name):
         tokens = query.split()
@@ -240,6 +255,35 @@ class DbReplicatorRealtime:
 
             ch_clauses.append(f"`{src_db_name}`.`{src_table_name}` TO `{dest_db_name}`.`{dest_table_name}`")
         self.replicator.clickhouse_api.execute_command(f'RENAME TABLE {", ".join(ch_clauses)}')
+
+    def handle_truncate_query(self, query, db_name):
+        """Handle TRUNCATE TABLE operations by clearing data in ClickHouse"""
+        tokens = query.strip().split()
+        if len(tokens) < 3 or tokens[0].lower() != 'truncate' or tokens[1].lower() != 'table':
+            raise Exception('Invalid TRUNCATE query format', query)
+
+        # Get table name from the third token (after TRUNCATE TABLE)
+        table_token = tokens[2]
+        
+        # Parse database and table name from the token
+        db_name, table_name, matches_config = self.replicator.converter.get_db_and_table_name(table_token, db_name)
+        if not matches_config:
+            return
+
+        # Check if table exists in our tracking
+        if table_name not in self.replicator.state.tables_structure:
+            logger.warning(f'TRUNCATE: Table {table_name} not found in tracked tables, skipping')
+            return
+
+        # Clear any pending records for this table
+        if table_name in self.records_to_insert:
+            self.records_to_insert[table_name].clear()
+        if table_name in self.records_to_delete:
+            self.records_to_delete[table_name].clear()
+
+        # Execute TRUNCATE on ClickHouse
+        logger.info(f'Executing TRUNCATE on ClickHouse table: {db_name}.{table_name}')
+        self.replicator.clickhouse_api.execute_command(f'TRUNCATE TABLE `{db_name}`.`{table_name}`')
 
     def log_stats_if_required(self):
         curr_time = time.time()

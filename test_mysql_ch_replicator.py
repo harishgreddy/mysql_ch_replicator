@@ -134,6 +134,11 @@ CREATE TABLE `{TEST_TABLE_NAME}` (
     assert_wait(lambda: TEST_TABLE_NAME in ch.get_tables())
     assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == 2)
 
+    # Check for custom partition_by configuration when using CONFIG_FILE (tests_config.yaml)
+    if config_file == CONFIG_FILE_MARIADB:
+        create_query = ch.show_create_table(TEST_TABLE_NAME)
+        assert 'PARTITION BY intDiv(id, 1000000)' in create_query, f"Custom partition_by not found in CREATE TABLE query: {create_query}"
+
     mysql.execute(f"INSERT INTO `{TEST_TABLE_NAME}` (name, age) VALUES ('Filipp', 50);", commit=True)
     assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == 3)
     assert_wait(lambda: ch.select(TEST_TABLE_NAME, where="name='Filipp'")[0]['age'] == 50)
@@ -1420,6 +1425,17 @@ CREATE TABLE `{TEST_TABLE_NAME}` (
     assert_wait(lambda: ch.select(TEST_TABLE_NAME, where="id=44")[0]['c1'] == 111)
     assert_wait(lambda: ch.select(TEST_TABLE_NAME, where="id=44")[0]['c2'] == 222)
 
+    # Test add KEY
+    mysql.execute(
+        f"ALTER TABLE `{TEST_TABLE_NAME}` ADD KEY `idx_c1_c2` (`c1`,`c2`)")
+    mysql.execute(
+        f"INSERT INTO `{TEST_TABLE_NAME}` (id, c1, c2) VALUES (46, 333, 444)",
+        commit=True,
+    )
+    assert_wait(lambda: len(ch.select(TEST_TABLE_NAME, where="id=46")) == 1)
+    assert_wait(lambda: ch.select(TEST_TABLE_NAME, where="id=46")[0]['c1'] == 333)
+    assert_wait(lambda: ch.select(TEST_TABLE_NAME, where="id=46")[0]['c2'] == 444)
+    
     # Test drop column
     mysql.execute(
         f"ALTER TABLE `{TEST_TABLE_NAME}` DROP COLUMN c2")
@@ -2454,3 +2470,280 @@ def test_dynamic_column_addition_user_config():
     db_pid = get_db_replicator_pid(cfg, "test_replication")
     if db_pid:
         kill_process(db_pid)
+
+
+def test_ignore_deletes():
+    # Create a temporary config file with ignore_deletes=True
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as temp_config_file:
+        config_file = temp_config_file.name
+        
+        # Read the original config
+        with open(CONFIG_FILE, 'r') as original_config:
+            config_data = yaml.safe_load(original_config)
+        
+        # Add ignore_deletes=True
+        config_data['ignore_deletes'] = True
+        
+        # Write to the temp file
+        yaml.dump(config_data, temp_config_file)
+
+    try:
+        cfg = config.Settings()
+        cfg.load(config_file)
+        
+        # Verify the ignore_deletes option was set
+        assert cfg.ignore_deletes is True
+
+        mysql = mysql_api.MySQLApi(
+            database=None,
+            mysql_settings=cfg.mysql,
+        )
+
+        ch = clickhouse_api.ClickhouseApi(
+            database=TEST_DB_NAME,
+            clickhouse_settings=cfg.clickhouse,
+        )
+
+        prepare_env(cfg, mysql, ch)
+
+        # Create a table with a composite primary key
+        mysql.execute(f'''
+        CREATE TABLE `{TEST_TABLE_NAME}` (
+            departments int(11) NOT NULL,
+            termine int(11) NOT NULL,
+            data varchar(255) NOT NULL,
+            PRIMARY KEY (departments,termine)
+        )
+        ''')
+
+        # Insert initial records
+        mysql.execute(f"INSERT INTO `{TEST_TABLE_NAME}` (departments, termine, data) VALUES (10, 20, 'data1');", commit=True)
+        mysql.execute(f"INSERT INTO `{TEST_TABLE_NAME}` (departments, termine, data) VALUES (30, 40, 'data2');", commit=True)
+        mysql.execute(f"INSERT INTO `{TEST_TABLE_NAME}` (departments, termine, data) VALUES (50, 60, 'data3');", commit=True)
+
+        # Run the replicator with ignore_deletes=True
+        run_all_runner = RunAllRunner(cfg_file=config_file)
+        run_all_runner.run()
+
+        # Wait for replication to complete
+        assert_wait(lambda: TEST_DB_NAME in ch.get_databases())
+        ch.execute_command(f'USE `{TEST_DB_NAME}`')
+        assert_wait(lambda: TEST_TABLE_NAME in ch.get_tables())
+        assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == 3)
+
+        # Delete some records from MySQL
+        mysql.execute(f"DELETE FROM `{TEST_TABLE_NAME}` WHERE departments=10;", commit=True)
+        mysql.execute(f"DELETE FROM `{TEST_TABLE_NAME}` WHERE departments=30;", commit=True)
+        
+        # Wait a moment to ensure replication processes the events
+        time.sleep(5)
+        
+        # Verify records are NOT deleted in ClickHouse (since ignore_deletes=True)
+        # The count should still be 3
+        assert len(ch.select(TEST_TABLE_NAME)) == 3, "Deletions were processed despite ignore_deletes=True"
+        
+        # Insert a new record and verify it's added
+        mysql.execute(f"INSERT INTO `{TEST_TABLE_NAME}` (departments, termine, data) VALUES (70, 80, 'data4');", commit=True)
+        assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == 4)
+        
+        # Verify the new record is correctly added
+        result = ch.select(TEST_TABLE_NAME, where="departments=70 AND termine=80")
+        assert len(result) == 1
+        assert result[0]['data'] == 'data4'
+        
+        # Clean up
+        run_all_runner.stop()
+        
+        # Verify no errors occurred
+        assert_wait(lambda: 'stopping db_replicator' in read_logs(TEST_DB_NAME))
+        assert('Traceback' not in read_logs(TEST_DB_NAME))
+        
+        # Additional tests for persistence after restart
+        
+        # 1. Remove all entries from table in MySQL
+        mysql.execute(f"DELETE FROM `{TEST_TABLE_NAME}` WHERE 1=1;", commit=True)
+
+                # Add a new row in MySQL before starting the replicator
+        mysql.execute(f"INSERT INTO `{TEST_TABLE_NAME}` (departments, termine, data) VALUES (110, 120, 'offline_data');", commit=True)
+        
+        # 2. Wait 5 seconds
+        time.sleep(5)
+        
+        # 3. Remove binlog directory (similar to prepare_env, but without removing tables)
+        if os.path.exists(cfg.binlog_replicator.data_dir):
+            shutil.rmtree(cfg.binlog_replicator.data_dir)
+        os.mkdir(cfg.binlog_replicator.data_dir)
+        
+
+        # 4. Create and run a new runner
+        new_runner = RunAllRunner(cfg_file=config_file)
+        new_runner.run()
+        
+        # 5. Ensure it has all the previous data (should still be 4 records from before + 1 new offline record)
+        assert_wait(lambda: TEST_DB_NAME in ch.get_databases())
+        ch.execute_command(f'USE `{TEST_DB_NAME}`')
+        assert_wait(lambda: TEST_TABLE_NAME in ch.get_tables())
+        assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == 5)
+        
+        # Verify we still have all the old data
+        assert len(ch.select(TEST_TABLE_NAME, where="departments=10 AND termine=20")) == 1
+        assert len(ch.select(TEST_TABLE_NAME, where="departments=30 AND termine=40")) == 1
+        assert len(ch.select(TEST_TABLE_NAME, where="departments=50 AND termine=60")) == 1
+        assert len(ch.select(TEST_TABLE_NAME, where="departments=70 AND termine=80")) == 1
+        
+        # Verify the offline data was replicated
+        assert len(ch.select(TEST_TABLE_NAME, where="departments=110 AND termine=120")) == 1
+        offline_data = ch.select(TEST_TABLE_NAME, where="departments=110 AND termine=120")[0]
+        assert offline_data['data'] == 'offline_data'
+        
+        # 6. Insert new data and verify it gets added to existing data
+        mysql.execute(f"INSERT INTO `{TEST_TABLE_NAME}` (departments, termine, data) VALUES (90, 100, 'data5');", commit=True)
+        assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == 6)
+        
+        # Verify the combined old and new data
+        result = ch.select(TEST_TABLE_NAME, where="departments=90 AND termine=100")
+        assert len(result) == 1
+        assert result[0]['data'] == 'data5'
+        
+        # Make sure we have all 6 records (4 original + 1 offline + 1 new one)
+        assert len(ch.select(TEST_TABLE_NAME)) == 6
+        
+        new_runner.stop()
+    finally:
+        # Clean up the temporary config file
+        os.unlink(config_file)
+
+def test_issue_160_unknown_mysql_type_bug():
+    """
+    Test to reproduce the bug from issue #160.
+    
+    Bug Description: Replication fails when adding a new table during realtime replication
+    with Exception: unknown mysql type ""
+    
+    This test should FAIL until the bug is fixed.
+    When the bug is present: parsing will fail with unknown mysql type and the test will FAIL
+    When the bug is fixed: parsing will succeed and the test will PASS
+    """
+    # The exact CREATE TABLE statement from the bug report
+    create_table_query = """create table test_table
+(
+    id    bigint          not null,
+    col_a datetime(6)     not null,
+    col_b datetime(6)     null,
+    col_c varchar(255)    not null,
+    col_d varchar(255)    not null,
+    col_e int             not null,
+    col_f decimal(20, 10) not null,
+    col_g decimal(20, 10) not null,
+    col_h datetime(6)     not null,
+    col_i date            not null,
+    col_j varchar(255)    not null,
+    col_k varchar(255)    not null,
+    col_l bigint          not null,
+    col_m varchar(50)     not null,
+    col_n bigint          null,
+    col_o decimal(20, 1)  null,
+    col_p date            null,
+    primary key (id, col_e)
+);"""
+
+    # Create a converter instance
+    converter = MysqlToClickhouseConverter()
+    
+    # This should succeed when the bug is fixed
+    # When the bug is present, this will raise "unknown mysql type """ and the test will FAIL
+    mysql_structure, ch_structure = converter.parse_create_table_query(create_table_query)
+    
+    # Verify the parsing worked correctly
+    assert mysql_structure.table_name == 'test_table'
+    assert len(mysql_structure.fields) == 17  # All columns should be parsed
+    assert mysql_structure.primary_keys == ['id', 'col_e']
+
+def test_truncate_operation_bug_issue_155():
+    """
+    Test to reproduce the bug from issue #155.
+    
+    Bug Description: TRUNCATE operation is not replicated - data is not cleared on ClickHouse side
+    
+    This test should FAIL until the bug is fixed.
+    When the bug is present: TRUNCATE will not clear ClickHouse data and the test will FAIL
+    When the bug is fixed: TRUNCATE will clear ClickHouse data and the test will PASS
+    """
+    cfg = config.Settings()
+    cfg.load(CONFIG_FILE)
+
+    mysql = mysql_api.MySQLApi(
+        database=None,
+        mysql_settings=cfg.mysql,
+    )
+
+    ch = clickhouse_api.ClickhouseApi(
+        database=TEST_DB_NAME,
+        clickhouse_settings=cfg.clickhouse,
+    )
+
+    prepare_env(cfg, mysql, ch)
+
+    # Create a test table
+    mysql.execute(f'''
+CREATE TABLE `{TEST_TABLE_NAME}` (
+    id int NOT NULL AUTO_INCREMENT,
+    name varchar(255),
+    age int,
+    PRIMARY KEY (id)
+); 
+    ''')
+
+    # Insert test data
+    mysql.execute(f"INSERT INTO `{TEST_TABLE_NAME}` (name, age) VALUES ('Alice', 25);", commit=True)
+    mysql.execute(f"INSERT INTO `{TEST_TABLE_NAME}` (name, age) VALUES ('Bob', 30);", commit=True)
+    mysql.execute(f"INSERT INTO `{TEST_TABLE_NAME}` (name, age) VALUES ('Charlie', 35);", commit=True)
+
+    # Start replication
+    binlog_replicator_runner = BinlogReplicatorRunner()
+    binlog_replicator_runner.run()
+    db_replicator_runner = DbReplicatorRunner(TEST_DB_NAME)
+    db_replicator_runner.run()
+
+    # Wait for initial replication
+    assert_wait(lambda: TEST_DB_NAME in ch.get_databases())
+    ch.execute_command(f'USE `{TEST_DB_NAME}`')
+    assert_wait(lambda: TEST_TABLE_NAME in ch.get_tables())
+    assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == 3)
+
+    # Verify data is replicated correctly
+    mysql.execute(f"SELECT COUNT(*) FROM `{TEST_TABLE_NAME}`")
+    mysql_count = mysql.cursor.fetchall()[0][0]
+    assert mysql_count == 3
+
+    ch_count = len(ch.select(TEST_TABLE_NAME))
+    assert ch_count == 3
+
+    # Execute TRUNCATE TABLE in MySQL
+    mysql.execute(f"TRUNCATE TABLE `{TEST_TABLE_NAME}`;", commit=True)
+    
+    # Verify MySQL table is now empty
+    mysql.execute(f"SELECT COUNT(*) FROM `{TEST_TABLE_NAME}`")
+    mysql_count_after_truncate = mysql.cursor.fetchall()[0][0]
+    assert mysql_count_after_truncate == 0, "MySQL table should be empty after TRUNCATE"
+
+    # Wait for replication to process the TRUNCATE operation
+    time.sleep(5)  # Give some time for the operation to be processed
+
+    # This is where the bug manifests: ClickHouse table should be empty but it's not
+    # When the bug is present, this assertion will FAIL because data is not cleared in ClickHouse
+    ch_count_after_truncate = len(ch.select(TEST_TABLE_NAME))
+    assert ch_count_after_truncate == 0, f"ClickHouse table should be empty after TRUNCATE, but contains {ch_count_after_truncate} records"
+
+    # Insert new data to verify replication still works after TRUNCATE
+    mysql.execute(f"INSERT INTO `{TEST_TABLE_NAME}` (name, age) VALUES ('Dave', 40);", commit=True)
+    assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == 1)
+    
+    # Verify the new record
+    new_record = ch.select(TEST_TABLE_NAME, where="name='Dave'")
+    assert len(new_record) == 1
+    assert new_record[0]['age'] == 40
+
+    # Clean up
+    db_replicator_runner.stop()
+    binlog_replicator_runner.stop()
