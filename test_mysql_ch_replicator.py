@@ -1179,10 +1179,8 @@ CREATE TABLE `{TEST_TABLE_NAME}` (
 
 
 def test_string_primary_key(monkeypatch):
-    monkeypatch.setattr(DbReplicatorInitial, 'INITIAL_REPLICATION_BATCH_SIZE', 1)
-
     cfg = config.Settings()
-    cfg.load(CONFIG_FILE)
+    cfg.load('tests_config_string_primary_key.yaml')
 
     mysql = mysql_api.MySQLApi(
         database=None,
@@ -1217,9 +1215,9 @@ CREATE TABLE `{TEST_TABLE_NAME}` (
         commit=True,
     )
 
-    binlog_replicator_runner = BinlogReplicatorRunner()
+    binlog_replicator_runner = BinlogReplicatorRunner(cfg_file='tests_config_string_primary_key.yaml')
     binlog_replicator_runner.run()
-    db_replicator_runner = DbReplicatorRunner(TEST_DB_NAME)
+    db_replicator_runner = DbReplicatorRunner(TEST_DB_NAME, cfg_file='tests_config_string_primary_key.yaml')
     db_replicator_runner.run()
 
     assert_wait(lambda: TEST_DB_NAME in ch.get_databases())
@@ -1241,10 +1239,8 @@ CREATE TABLE `{TEST_TABLE_NAME}` (
 
 
 def test_if_exists_if_not_exists(monkeypatch):
-    monkeypatch.setattr(DbReplicatorInitial, 'INITIAL_REPLICATION_BATCH_SIZE', 1)
-
     cfg = config.Settings()
-    cfg.load(CONFIG_FILE)
+    cfg.load('tests_config_string_primary_key.yaml')
 
     mysql = mysql_api.MySQLApi(
         database=None,
@@ -1258,9 +1254,9 @@ def test_if_exists_if_not_exists(monkeypatch):
 
     prepare_env(cfg, mysql, ch)
 
-    binlog_replicator_runner = BinlogReplicatorRunner()
+    binlog_replicator_runner = BinlogReplicatorRunner(cfg_file='tests_config_string_primary_key.yaml')
     binlog_replicator_runner.run()
-    db_replicator_runner = DbReplicatorRunner(TEST_DB_NAME)
+    db_replicator_runner = DbReplicatorRunner(TEST_DB_NAME, cfg_file='tests_config_string_primary_key.yaml')
     db_replicator_runner.run()
 
     assert_wait(lambda: TEST_DB_NAME in ch.get_databases())
@@ -1282,10 +1278,8 @@ def test_if_exists_if_not_exists(monkeypatch):
 
 
 def test_percona_migration(monkeypatch):
-    monkeypatch.setattr(DbReplicatorInitial, 'INITIAL_REPLICATION_BATCH_SIZE', 1)
-
     cfg = config.Settings()
-    cfg.load(CONFIG_FILE)
+    cfg.load('tests_config_string_primary_key.yaml')
 
     mysql = mysql_api.MySQLApi(
         database=None,
@@ -1310,9 +1304,9 @@ CREATE TABLE `{TEST_TABLE_NAME}` (
         commit=True,
     )
 
-    binlog_replicator_runner = BinlogReplicatorRunner()
+    binlog_replicator_runner = BinlogReplicatorRunner(cfg_file='tests_config_string_primary_key.yaml')
     binlog_replicator_runner.run()
-    db_replicator_runner = DbReplicatorRunner(TEST_DB_NAME)
+    db_replicator_runner = DbReplicatorRunner(TEST_DB_NAME, cfg_file='tests_config_string_primary_key.yaml')
     db_replicator_runner.run()
 
     assert_wait(lambda: TEST_DB_NAME in ch.get_databases())
@@ -1360,10 +1354,8 @@ CREATE TABLE `{TEST_DB_NAME}`.`_{TEST_TABLE_NAME}_new` (
 
 
 def test_add_column_first_after_and_drop_column(monkeypatch):
-    monkeypatch.setattr(DbReplicatorInitial, 'INITIAL_REPLICATION_BATCH_SIZE', 1)
-
     cfg = config.Settings()
-    cfg.load(CONFIG_FILE)
+    cfg.load('tests_config_string_primary_key.yaml')
 
     mysql = mysql_api.MySQLApi(
         database=None,
@@ -1388,9 +1380,9 @@ CREATE TABLE `{TEST_TABLE_NAME}` (
         commit=True,
     )
 
-    binlog_replicator_runner = BinlogReplicatorRunner()
+    binlog_replicator_runner = BinlogReplicatorRunner(cfg_file='tests_config_string_primary_key.yaml')
     binlog_replicator_runner.run()
-    db_replicator_runner = DbReplicatorRunner(TEST_DB_NAME)
+    db_replicator_runner = DbReplicatorRunner(TEST_DB_NAME, cfg_file='tests_config_string_primary_key.yaml')
     db_replicator_runner.run()
 
     assert_wait(lambda: TEST_DB_NAME in ch.get_databases())
@@ -2747,3 +2739,289 @@ CREATE TABLE `{TEST_TABLE_NAME}` (
     # Clean up
     db_replicator_runner.stop()
     binlog_replicator_runner.stop()
+
+def test_json2():
+    cfg = config.Settings()
+    cfg.load(CONFIG_FILE)
+
+    mysql = mysql_api.MySQLApi(
+        database=None,
+        mysql_settings=cfg.mysql,
+    )
+
+    ch = clickhouse_api.ClickhouseApi(
+        database=TEST_DB_NAME,
+        clickhouse_settings=cfg.clickhouse,
+    )
+
+    prepare_env(cfg, mysql, ch)
+
+    mysql.execute("SET sql_mode = 'ALLOW_INVALID_DATES';")
+
+    mysql.execute(f'''
+CREATE TABLE `{TEST_TABLE_NAME}` (
+    `id` int unsigned NOT NULL AUTO_INCREMENT,
+    name varchar(255),
+    data json,
+    PRIMARY KEY (id)
+); 
+    ''')
+
+    mysql.execute(
+        f"INSERT INTO `{TEST_TABLE_NAME}` (name, data) VALUES " +
+        """('Ivan', '{"а": "б", "в": [1,2,3]}');""",
+        commit=True,
+    )
+
+    binlog_replicator_runner = BinlogReplicatorRunner()
+    binlog_replicator_runner.run()
+    db_replicator_runner = DbReplicatorRunner(TEST_DB_NAME)
+    db_replicator_runner.run()
+
+    assert_wait(lambda: TEST_DB_NAME in ch.get_databases())
+
+    ch.execute_command(f'USE `{TEST_DB_NAME}`')
+
+    assert_wait(lambda: TEST_TABLE_NAME in ch.get_tables())
+    assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == 1)
+
+    mysql.execute(
+        f"INSERT INTO `{TEST_TABLE_NAME}` (name, data) VALUES " +
+        """('Peter', '{"в": "б", "а": [3,2,1]}');""",
+        commit=True,
+    )
+    assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == 2)
+
+    assert json.loads(ch.select(TEST_TABLE_NAME, "name='Ivan'")[0]['data'])['в'] == [1, 2, 3]
+    assert json.loads(ch.select(TEST_TABLE_NAME, "name='Peter'")[0]['data'])['в'] == 'б'
+    db_replicator_runner.stop()
+    binlog_replicator_runner.stop()
+
+def test_timezone_conversion():
+    """
+    Test that MySQL timestamp fields are converted to ClickHouse DateTime64 with custom timezone.
+    This test reproduces the issue from GitHub issue #170.
+    """
+    # Create a temporary config file with custom timezone
+    config_content = """
+mysql:
+  host: 'localhost'
+  port: 9306
+  user: 'root'
+  password: 'admin'
+
+clickhouse:
+  host: 'localhost'
+  port: 9123
+  user: 'default'
+  password: 'admin'
+
+binlog_replicator:
+  data_dir: '/app/binlog/'
+  records_per_file: 100000
+
+databases: '*test*'
+log_level: 'debug'
+mysql_timezone: 'America/New_York'
+"""
+    
+    # Create temporary config file
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+        f.write(config_content)
+        temp_config_file = f.name
+    
+    try:
+        cfg = config.Settings()
+        cfg.load(temp_config_file)
+        
+        # Verify timezone is loaded correctly
+        assert cfg.mysql_timezone == 'America/New_York'
+        
+        mysql = mysql_api.MySQLApi(
+            database=None,
+            mysql_settings=cfg.mysql,
+        )
+
+        ch = clickhouse_api.ClickhouseApi(
+            database=TEST_DB_NAME,
+            clickhouse_settings=cfg.clickhouse,
+        )
+
+        prepare_env(cfg, mysql, ch)
+
+        # Create table with timestamp fields
+        mysql.execute(f'''
+        CREATE TABLE `{TEST_TABLE_NAME}` (
+            id int NOT NULL AUTO_INCREMENT,
+            name varchar(255),
+            created_at timestamp NULL,
+            updated_at timestamp(3) NULL,
+            PRIMARY KEY (id)
+        );
+        ''')
+
+        # Insert test data with specific timestamp
+        mysql.execute(
+            f"INSERT INTO `{TEST_TABLE_NAME}` (name, created_at, updated_at) "
+            f"VALUES ('test_timezone', '2023-08-15 14:30:00', '2023-08-15 14:30:00.123');",
+            commit=True,
+        )
+
+        # Run replication
+        run_all_runner = RunAllRunner(cfg_file=temp_config_file)
+        run_all_runner.run()
+
+        assert_wait(lambda: TEST_DB_NAME in ch.get_databases())
+        ch.execute_command(f'USE `{TEST_DB_NAME}`')
+        assert_wait(lambda: TEST_TABLE_NAME in ch.get_tables())
+        assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == 1)
+
+        # Get the table structure from ClickHouse
+        table_info = ch.query(f'DESCRIBE `{TEST_TABLE_NAME}`')
+        
+        # Check that timestamp fields are converted to DateTime64 with timezone
+        created_at_type = None
+        updated_at_type = None
+        for row in table_info.result_rows:
+            if row[0] == 'created_at':
+                created_at_type = row[1]
+            elif row[0] == 'updated_at':
+                updated_at_type = row[1]
+        
+        # Verify the types include the timezone
+        assert created_at_type is not None
+        assert updated_at_type is not None
+        assert 'America/New_York' in created_at_type
+        assert 'America/New_York' in updated_at_type
+        
+        # Verify data was inserted correctly
+        results = ch.select(TEST_TABLE_NAME)
+        assert len(results) == 1
+        assert results[0]['name'] == 'test_timezone'
+        
+        run_all_runner.stop()
+        
+    finally:
+        # Clean up temporary config file
+        os.unlink(temp_config_file)
+
+def test_resume_initial_replication_with_ignore_deletes():
+    """
+    Test that resuming initial replication works correctly with ignore_deletes=True.
+    
+    This reproduces the bug from https://github.com/bakwc/mysql_ch_replicator/issues/172
+    where resuming initial replication would fail with "Database sirocco_tmp does not exist"
+    when ignore_deletes=True because the code would try to use the _tmp database instead
+    of the target database directly.
+    """
+    # Create a temporary config file with ignore_deletes=True
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as temp_config_file:
+        config_file = temp_config_file.name
+        
+        # Read the original config
+        with open(CONFIG_FILE, 'r') as original_config:
+            config_data = yaml.safe_load(original_config)
+        
+        # Add ignore_deletes=True
+        config_data['ignore_deletes'] = True
+        
+        # Set initial_replication_batch_size to 1 for testing
+        config_data['initial_replication_batch_size'] = 1
+        
+        # Write to the temp file
+        yaml.dump(config_data, temp_config_file)
+
+    try:
+        cfg = config.Settings()
+        cfg.load(config_file)
+        
+        # Verify the ignore_deletes option was set
+        assert cfg.ignore_deletes is True
+
+        mysql = mysql_api.MySQLApi(
+            database=None,
+            mysql_settings=cfg.mysql,
+        )
+
+        ch = clickhouse_api.ClickhouseApi(
+            database=TEST_DB_NAME,
+            clickhouse_settings=cfg.clickhouse,
+        )
+
+        prepare_env(cfg, mysql, ch)
+
+        # Create a table with many records to ensure initial replication takes time
+        mysql.execute(f'''
+        CREATE TABLE `{TEST_TABLE_NAME}` (
+            id int NOT NULL AUTO_INCREMENT,
+            name varchar(255),
+            data varchar(1000),
+            PRIMARY KEY (id)
+        )
+        ''')
+
+        # Insert many records to make initial replication take longer
+        for i in range(100):
+            mysql.execute(
+                f"INSERT INTO `{TEST_TABLE_NAME}` (name, data) VALUES ('test_{i}', 'data_{i}');",
+                commit=True
+            )
+
+        # Start binlog replicator
+        binlog_replicator_runner = BinlogReplicatorRunner(cfg_file=config_file)
+        binlog_replicator_runner.run()
+
+        # Start db replicator for initial replication with test flag to exit early
+        db_replicator_runner = DbReplicatorRunner(TEST_DB_NAME, cfg_file=config_file, 
+                                                 additional_arguments='--initial-replication-test-fail-records 30')
+        db_replicator_runner.run()
+        
+        # Wait for initial replication to start
+        assert_wait(lambda: TEST_DB_NAME in ch.get_databases())
+        ch.execute_command(f'USE `{TEST_DB_NAME}`')
+        assert_wait(lambda: TEST_TABLE_NAME in ch.get_tables())
+        
+        # Wait for some records to be replicated but not all (should hit the 30 record limit)
+        assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) > 0)
+        
+        # The db replicator should have stopped automatically due to the test flag
+        # But we still call stop() to ensure proper cleanup
+        db_replicator_runner.stop()
+        
+        # Verify the state is still PERFORMING_INITIAL_REPLICATION
+        state_path = os.path.join(cfg.binlog_replicator.data_dir, TEST_DB_NAME, 'state.pckl')
+        state = DbReplicatorState(state_path)
+        assert state.status.value == 2  # PERFORMING_INITIAL_REPLICATION
+        
+        # Add more records while replication is stopped
+        for i in range(100, 150):
+            mysql.execute(
+                f"INSERT INTO `{TEST_TABLE_NAME}` (name, data) VALUES ('test_{i}', 'data_{i}');",
+                commit=True
+            )
+
+        # Verify that sirocco_tmp database does NOT exist (it should use sirocco directly)
+        assert f"{TEST_DB_NAME}_tmp" not in ch.get_databases(), "Temporary database should not exist with ignore_deletes=True"
+        
+        # Resume initial replication - this should NOT fail with "Database sirocco_tmp does not exist"
+        db_replicator_runner_2 = DbReplicatorRunner(TEST_DB_NAME, cfg_file=config_file)
+        db_replicator_runner_2.run()
+        
+        # Wait for all records to be replicated (100 original + 50 extra = 150)
+        assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == 150, max_wait_time=30)
+        
+        # Verify the replication completed successfully
+        records = ch.select(TEST_TABLE_NAME)
+        assert len(records) == 150, f"Expected 150 records, got {len(records)}"
+        
+        # Verify we can continue with realtime replication
+        mysql.execute(f"INSERT INTO `{TEST_TABLE_NAME}` (name, data) VALUES ('realtime_test', 'realtime_data');", commit=True)
+        assert_wait(lambda: len(ch.select(TEST_TABLE_NAME)) == 151)
+        
+        # Clean up
+        db_replicator_runner_2.stop()
+        binlog_replicator_runner.stop()
+        
+    finally:
+        # Clean up temp config file
+        os.unlink(config_file)
