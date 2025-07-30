@@ -323,6 +323,8 @@ class MysqlToClickhouseConverter:
             return 'Bool'
         if mysql_type == 'bit(1)':
             return 'Bool'
+        if mysql_type == 'bit':
+            return 'Bool'
         if mysql_type == 'bool':
             return 'Bool'
         if 'smallint' in mysql_type:
