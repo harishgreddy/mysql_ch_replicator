@@ -599,6 +599,11 @@ class MysqlToClickhouseConverter:
         if tokens[0].lower() != 'alter':
             raise Exception('wrong query')
 
+        # Skip ALTER DATABASE queries - they're MySQL-specific and not applicable to ClickHouse
+        if tokens[1].lower() == 'database':
+            logger.info(f'Skipping ALTER DATABASE query (not applicable to ClickHouse): {mysql_query}')
+            return
+
         if tokens[1].lower() != 'table':
             raise Exception('wrong query')
 
@@ -617,6 +622,7 @@ class MysqlToClickhouseConverter:
             op_name = tokens[0].lower()
             tokens = tokens[1:]
 
+            # Skip charset/collation operations - they're MySQL-specific
             if op_name in ('convert', 'character', 'collate', 'default'):
                 logger.info(f'Skipping charset/collation operation for table {table_name}: {op_name}')
                 continue
