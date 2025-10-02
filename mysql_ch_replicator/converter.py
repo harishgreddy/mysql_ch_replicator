@@ -644,12 +644,25 @@ class MysqlToClickhouseConverter:
             if op_name == 'change':
                 self.__convert_alter_table_change_column(db_name, table_name, tokens)
                 continue
-            
+
             if op_name == 'rename':
                 # Handle RENAME COLUMN operation
                 if tokens[0].lower() == 'column':
                     tokens = tokens[1:]  # Skip the COLUMN keyword
                 self.__convert_alter_table_rename_column(db_name, table_name, tokens)
+                continue
+
+            if op_name == 'convert':
+                # Handle CONVERT TO CHARACTER SET operation
+                # ClickHouse doesn't use MySQL charsets, so we skip this
+                continue
+
+            if op_name == 'character':
+                # Handle CHARACTER SET operation
+                continue
+
+            if op_name == 'collate':
+                # Handle COLLATE operation
                 continue
 
             raise Exception(f'operation {op_name} not implement, query: {subquery}, full query: {mysql_query}')
