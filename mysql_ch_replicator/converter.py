@@ -617,7 +617,11 @@ class MysqlToClickhouseConverter:
             op_name = tokens[0].lower()
             tokens = tokens[1:]
 
-            if tokens[0].lower() == 'column':
+            if op_name in ('convert', 'character', 'collate', 'default'):
+                logger.info(f'Skipping charset/collation operation for table {table_name}: {op_name}')
+                continue
+
+            if tokens and tokens[0].lower() == 'column':
                 tokens = tokens[1:]
 
             if op_name == 'add':
@@ -647,35 +651,13 @@ class MysqlToClickhouseConverter:
                 continue
 
             if op_name == 'rename':
-                # Handle RENAME COLUMN operation
-                if tokens[0].lower() == 'column':
-                    tokens = tokens[1:]  # Skip the COLUMN keyword
+                if tokens and tokens[0].lower() == 'column':
+                    tokens = tokens[1:]
                 self.__convert_alter_table_rename_column(db_name, table_name, tokens)
                 continue
 
-            if op_name == 'convert':
-                # Handle CONVERT TO CHARACTER SET operation
-                # ClickHouse doesn't use MySQL charsets, so we skip this
-                logger.info(f'Skipping charset conversion for table {table_name}: {subquery}')
-                continue
-
-            if op_name == 'default':
-                # Handle DEFAULT CHARACTER SET / DEFAULT COLLATE operations
-                # These are MySQL-specific and don't apply to ClickHouse
-                logger.info(f'Skipping default charset/collation for table {table_name}: {subquery}')
-                continue
-
-            if op_name == 'character':
-                # Handle CHARACTER SET operation
-                logger.info(f'Skipping character set change for table {table_name}: {subquery}')
-                continue
-
-            if op_name == 'collate':
-                # Handle COLLATE operation
-                logger.info(f'Skipping collation change for table {table_name}: {subquery}')
-                continue
-
-            raise Exception(f'operation {op_name} not implement, query: {subquery}, full query: {mysql_query}')
+            logger.error(f'Unhandled ALTER operation: {op_name}, query: {subquery}')
+            raise Exception(f'operation {op_name} not implemented, query: {subquery}, full query: {mysql_query}')
 
     @classmethod
     def _tokenize_alter_query(cls, sql_line):
