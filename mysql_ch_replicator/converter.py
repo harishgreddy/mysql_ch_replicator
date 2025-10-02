@@ -6,6 +6,7 @@ import re
 from pyparsing import Suppress, CaselessKeyword, Word, alphas, alphanums, delimitedList
 import copy
 
+from .binlog_replicator import logger
 from .table_structure import TableStructure, TableField
 from .enum import (
     parse_mysql_enum, EnumConverter,
@@ -655,14 +656,23 @@ class MysqlToClickhouseConverter:
             if op_name == 'convert':
                 # Handle CONVERT TO CHARACTER SET operation
                 # ClickHouse doesn't use MySQL charsets, so we skip this
+                logger.info(f'Skipping charset conversion for table {table_name}: {subquery}')
+                continue
+
+            if op_name == 'default':
+                # Handle DEFAULT CHARACTER SET / DEFAULT COLLATE operations
+                # These are MySQL-specific and don't apply to ClickHouse
+                logger.info(f'Skipping default charset/collation for table {table_name}: {subquery}')
                 continue
 
             if op_name == 'character':
                 # Handle CHARACTER SET operation
+                logger.info(f'Skipping character set change for table {table_name}: {subquery}')
                 continue
 
             if op_name == 'collate':
                 # Handle COLLATE operation
+                logger.info(f'Skipping collation change for table {table_name}: {subquery}')
                 continue
 
             raise Exception(f'operation {op_name} not implement, query: {subquery}, full query: {mysql_query}')
