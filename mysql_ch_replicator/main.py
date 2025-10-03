@@ -6,7 +6,6 @@ from logging.handlers import RotatingFileHandler
 import sys
 import os
 
-from .bulk_insert import run_hardcoded_bulk_insert
 from .config import Settings
 from .db_replicator import DbReplicator
 from .binlog_replicator import BinlogReplicator
@@ -150,7 +149,7 @@ def main():
     parser.add_argument(
         "mode", help="run mode",
         type=str,
-        choices=["run_all", "binlog_replicator", "db_replicator", "monitoring", "db_optimizer", "bulk_insert"])
+        choices=["run_all", "binlog_replicator", "db_replicator", "monitoring", "db_optimizer"])
     parser.add_argument("--config", help="config file path", default='config.yaml', type=str)
     parser.add_argument("--db", help="source database(s) name", type=str)
     parser.add_argument("--target_db", help="target database(s) name, if not set will be same as source", type=str)
@@ -175,46 +174,20 @@ def main():
         "--initial-replication-test-fail-records", type=int, default=None,
         help="FOR TESTING ONLY: Exit initial replication after processing this many records",
     )
-
-    # Bulk insert specific arguments
-    parser.add_argument(
-        "--source_db", type=str, default=None,
-        help="Source MySQL database name (for bulk_insert mode)",
-    )
-    parser.add_argument(
-        "--batch_size", type=int, default=50000,
-        help="Batch size for bulk insert processing (default: 50000)",
-    )
-    parser.add_argument(
-        "--threads", type=int, default=4,
-        help="Number of parallel threads for bulk insert (default: 4)",
-    )
-    parser.add_argument(
-        "--drop_existing", action="store_true",
-        help="Drop existing table in ClickHouse before bulk insert",
-    )
-    parser.add_argument(
-        "--no_resume", action="store_true",
-        help="Don't resume from existing records in bulk insert, start from beginning",
-    )
-
     args = parser.parse_args()
 
     config = Settings()
     config.load(args.config)
-
     if args.mode == 'binlog_replicator':
         run_binlog_replicator(args, config)
-    elif args.mode == 'db_replicator':
+    if args.mode == 'db_replicator':
         run_db_replicator(args, config)
-    elif args.mode == 'db_optimizer':
+    if args.mode == 'db_optimizer':
         run_db_optimizer(args, config)
-    elif args.mode == 'monitoring':
+    if args.mode == 'monitoring':
         run_monitoring(args, config)
-    elif args.mode == 'run_all':
+    if args.mode == 'run_all':
         run_all(args, config)
-    elif args.mode == 'bulk_insert':
-        run_hardcoded_bulk_insert(args, config)
 
 
 if __name__ == '__main__':
