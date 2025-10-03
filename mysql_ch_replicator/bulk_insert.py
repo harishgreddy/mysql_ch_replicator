@@ -4,8 +4,7 @@ import argparse
 import logging
 import time
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -35,26 +34,24 @@ class BulkInsertStats:
         return self.total_records_processed / elapsed if elapsed > 0 else 0
 
 
-class BulkInserter:
+class SafeBulkInserter:
     """
-    Standalone bulk insert utility for MySQL to ClickHouse data migration.
+    Safe single-threaded bulk insert utility for MySQL to ClickHouse data migration.
 
-    This operates independently of the existing replication system and can handle
-    excluded tables without affecting binlog replication, optimizer, or state files.
+    This operates independently of the existing replication system and avoids
+    threading issues that can cause segmentation faults.
     """
 
     DEFAULT_BATCH_SIZE = 50000
-    DEFAULT_THREADS = 4
 
     def __init__(self, config: Settings, source_db: str, target_db: str, table_name: str,
-                 batch_size: int = DEFAULT_BATCH_SIZE, threads: int = DEFAULT_THREADS,
-                 drop_existing: bool = False, resume: bool = True):
+                 batch_size: int = DEFAULT_BATCH_SIZE, drop_existing: bool = False,
+                 resume: bool = True):
         self.config = config
         self.source_db = source_db
         self.target_db = target_db
         self.table_name = table_name
         self.batch_size = batch_size
-        self.threads = threads
         self.drop_existing = drop_existing
         self.resume = resume
 
@@ -68,7 +65,6 @@ class BulkInserter:
 
         # Statistics tracking
         self.stats = BulkInsertStats()
-        self.stats_lock = Lock()
 
         # Table structures
         self.mysql_structure: Optional[TableStructure] = None
@@ -92,7 +88,7 @@ class BulkInserter:
         level = log_levels.get(log_level.lower(), logging.INFO)
         logging.basicConfig(
             level=level,
-            format='[BULK_INSERT %(asctime)s %(levelname)8s] %(message)s',
+            format='[SAFE_BULK_INSERT %(asctime)s %(levelname)8s] %(message)s',
             handlers=[logging.StreamHandler(sys.stderr)]
         )
 
@@ -213,7 +209,7 @@ class BulkInserter:
             self.logger.warning(f"Could not determine resume position: {e}")
             return None
 
-    def process_batch(self, worker_id: int, start_value: Optional[tuple] = None) -> tuple[int, Optional[tuple]]:
+    def process_batch(self, start_value: Optional[tuple] = None) -> tuple[int, Optional[tuple]]:
         """
         Process a single batch of records.
 
@@ -227,8 +223,8 @@ class BulkInserter:
                 order_by=self.mysql_structure.primary_keys,
                 limit=self.batch_size,
                 start_value=start_value,
-                worker_id=worker_id,
-                total_workers=self.threads
+                worker_id=None,  # Single-threaded
+                total_workers=None
             )
 
             if not records:
@@ -252,16 +248,14 @@ class BulkInserter:
             return len(records), last_primary_key
 
         except Exception as e:
-            self.logger.error(f"Worker {worker_id} batch processing error: {e}")
-            with self.stats_lock:
-                self.stats.errors += 1
+            self.logger.error(f"Batch processing error: {e}")
+            self.stats.errors += 1
             raise
 
     def update_stats(self, records_processed: int):
-        """Thread-safe stats update."""
-        with self.stats_lock:
-            self.stats.total_records_processed += records_processed
-            self.stats.total_batches_processed += 1
+        """Update statistics."""
+        self.stats.total_records_processed += records_processed
+        self.stats.total_batches_processed += 1
 
     def log_progress(self, total_records: int):
         """Log current progress."""
@@ -282,84 +276,8 @@ class BulkInserter:
             f"{rps:,.0f} records/sec | ETA: {eta_str} | Errors: {self.stats.errors}"
         )
 
-    def run_parallel_insert(self):
-        """Run bulk insert with parallel workers."""
-        self.logger.info(f"Starting bulk insert with {self.threads} threads, batch size {self.batch_size}")
-
-        total_records = self.get_total_record_count()
-        clickhouse_records = self.get_clickhouse_record_count()
-
-        self.logger.info(f"MySQL records: {total_records:,}")
-        self.logger.info(f"ClickHouse records: {clickhouse_records:,}")
-
-        if total_records <= clickhouse_records:
-            self.logger.info("ClickHouse already has all records, nothing to process")
-            return
-
-        estimated_remaining = total_records - clickhouse_records
-        self.logger.info(f"Estimated records to process: {estimated_remaining:,}")
-
-        # Use ThreadPoolExecutor for parallel processing
-        with ThreadPoolExecutor(max_workers=self.threads) as executor:
-            # Submit initial workers
-            futures = {}
-            for worker_id in range(self.threads):
-                future = executor.submit(self.process_worker_batches, worker_id, total_records)
-                futures[future] = worker_id
-
-            # Process completed workers and monitor progress
-            last_log_time = time.time()
-            for future in as_completed(futures):
-                worker_id = futures[future]
-                try:
-                    worker_stats = future.result()
-                    self.logger.info(f"Worker {worker_id} completed: {worker_stats}")
-                except Exception as e:
-                    self.logger.error(f"Worker {worker_id} failed: {e}")
-
-                # Log progress every 30 seconds
-                if time.time() - last_log_time > 30:
-                    self.log_progress(total_records)
-                    last_log_time = time.time()
-
-        # Final statistics
-        self.log_final_stats(total_records)
-
-    def process_worker_batches(self, worker_id: int, total_records: int) -> dict:
-        """Process batches for a single worker using hash-based partitioning."""
-        worker_stats = {'records': 0, 'batches': 0, 'errors': 0}
-
-        # For parallel workers, start from resume position or beginning
-        start_value = self.resume_position if worker_id == 0 else None
-
-        while True:
-            try:
-                records_processed, last_primary_key = self.process_batch(worker_id, start_value)
-
-                if records_processed == 0:
-                    break
-
-                worker_stats['records'] += records_processed
-                worker_stats['batches'] += 1
-
-                self.update_stats(records_processed)
-                start_value = last_primary_key
-
-                # Check if we should continue (simple termination check)
-                if records_processed < self.batch_size:
-                    break
-
-            except Exception as e:
-                worker_stats['errors'] += 1
-                if worker_stats['errors'] > 5:  # Stop worker after too many errors
-                    self.logger.error(f"Worker {worker_id} stopping due to too many errors")
-                    break
-                time.sleep(1)  # Brief pause before retry
-
-        return worker_stats
-
     def run_single_threaded_insert(self):
-        """Run bulk insert with single thread (simpler, more reliable)."""
+        """Run bulk insert with single thread (safe and reliable)."""
         self.logger.info(f"Starting single-threaded bulk insert, batch size {self.batch_size}")
 
         total_records = self.get_total_record_count()
@@ -380,7 +298,7 @@ class BulkInserter:
 
         while True:
             try:
-                records_processed, last_primary_key = self.process_batch(0, start_value)
+                records_processed, last_primary_key = self.process_batch(start_value)
 
                 if records_processed == 0:
                     break
@@ -399,7 +317,6 @@ class BulkInserter:
 
             except Exception as e:
                 self.logger.error(f"Batch processing error: {e}")
-                self.stats.errors += 1
                 if self.stats.errors > 10:
                     raise Exception("Too many errors, stopping bulk insert")
                 time.sleep(1)
@@ -434,11 +351,8 @@ class BulkInserter:
             # Create target table
             self.create_clickhouse_table()
 
-            # Run the bulk insert
-            if self.threads > 1:
-                self.run_parallel_insert()
-            else:
-                self.run_single_threaded_insert()
+            # Run single-threaded insert
+            self.run_single_threaded_insert()
 
             self.logger.info("Bulk insert completed successfully!")
 
@@ -447,20 +361,54 @@ class BulkInserter:
             raise
         finally:
             # Cleanup
-            if hasattr(self, 'mysql_api'):
-                self.mysql_api.close()
+            if hasattr(self, 'mysql_api') and self.mysql_api:
+                try:
+                    self.mysql_api.close()
+                except:
+                    pass  # Ignore cleanup errors
+
+
+# Function to be called from main.py
+def run_safe_bulk_insert(args, config: Settings):
+    """Entry point for safe bulk insert when called from main.py"""
+    # Use source_db if provided, otherwise fall back to db
+    source_db = getattr(args, 'source_db', None) or args.db
+    if not source_db:
+        raise Exception("--source_db or --db argument is required for bulk_insert mode")
+
+    # Use target_db if provided, otherwise use same as source_db
+    target_db = args.target_db or source_db
+
+    if not args.table:
+        raise Exception("--table argument is required for bulk_insert mode")
+
+    # Set up logging
+    log_tag = f'safe_bulk_insert {source_db}.{args.table}'
+    from .main import set_logging_config
+    set_logging_config(log_tag, log_level_str=config.log_level)
+
+    # Create and run bulk inserter
+    inserter = SafeBulkInserter(
+        config=config,
+        source_db=source_db,
+        target_db=target_db,
+        table_name=args.table,
+        batch_size=getattr(args, 'batch_size', SafeBulkInserter.DEFAULT_BATCH_SIZE),
+        drop_existing=getattr(args, 'drop_existing', False),
+        resume=not getattr(args, 'no_resume', False)
+    )
+
+    inserter.run()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Bulk insert utility for MySQL to ClickHouse")
+    parser = argparse.ArgumentParser(description="Safe bulk insert utility for MySQL to ClickHouse")
     parser.add_argument("--config", required=True, help="Config file path")
     parser.add_argument("--source-db", required=True, help="Source MySQL database name")
     parser.add_argument("--target-db", required=True, help="Target ClickHouse database name")
     parser.add_argument("--table", required=True, help="Table name to bulk insert")
-    parser.add_argument("--batch-size", type=int, default=BulkInserter.DEFAULT_BATCH_SIZE,
-                        help=f"Batch size for processing (default: {BulkInserter.DEFAULT_BATCH_SIZE})")
-    parser.add_argument("--threads", type=int, default=BulkInserter.DEFAULT_THREADS,
-                        help=f"Number of parallel threads (default: {BulkInserter.DEFAULT_THREADS})")
+    parser.add_argument("--batch-size", type=int, default=SafeBulkInserter.DEFAULT_BATCH_SIZE,
+                        help=f"Batch size for processing (default: {SafeBulkInserter.DEFAULT_BATCH_SIZE})")
     parser.add_argument("--drop-existing", action="store_true",
                         help="Drop existing table in ClickHouse before creating")
     parser.add_argument("--no-resume", action="store_true",
@@ -475,52 +423,17 @@ def main():
     config.load(args.config)
 
     # Create and run bulk inserter
-    inserter = BulkInserter(
+    inserter = SafeBulkInserter(
         config=config,
         source_db=args.source_db,
         target_db=args.target_db,
         table_name=args.table,
         batch_size=args.batch_size,
-        threads=args.threads,
         drop_existing=args.drop_existing,
-        resume=not args.no_resume  # resume is True unless --no-resume is specified
+        resume=not args.no_resume
     )
 
     inserter.setup_logging(args.log_level)
-    inserter.run()
-
-
-# Function to be called from main.py
-def run_bulk_insert(args, config: Settings):
-    """Entry point for bulk insert when called from main.py"""
-    # Use source_db if provided, otherwise fall back to db
-    source_db = getattr(args, 'source_db', None) or args.db
-    if not source_db:
-        raise Exception("--source_db or --db argument is required for bulk_insert mode")
-
-    # Use target_db if provided, otherwise use same as source_db
-    target_db = args.target_db or source_db
-
-    if not args.table:
-        raise Exception("--table argument is required for bulk_insert mode")
-
-    # Set up logging
-    log_tag = f'bulk_insert {source_db}.{args.table}'
-    from .main import set_logging_config
-    set_logging_config(log_tag, log_level_str=config.log_level)
-
-    # Create and run bulk inserter
-    inserter = BulkInserter(
-        config=config,
-        source_db=source_db,
-        target_db=target_db,
-        table_name=args.table,
-        batch_size=getattr(args, 'batch_size', BulkInserter.DEFAULT_BATCH_SIZE),
-        threads=getattr(args, 'threads', BulkInserter.DEFAULT_THREADS),
-        drop_existing=getattr(args, 'drop_existing', False),
-        resume=not getattr(args, 'no_resume', False)
-    )
-
     inserter.run()
 
 

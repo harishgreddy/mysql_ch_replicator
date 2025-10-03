@@ -6,7 +6,7 @@ from logging.handlers import RotatingFileHandler
 import sys
 import os
 
-from .bulk_insert import run_bulk_insert
+from .bulk_insert import run_safe_bulk_insert
 from .config import Settings
 from .db_replicator import DbReplicator
 from .binlog_replicator import BinlogReplicator
@@ -214,7 +214,7 @@ def main():
     elif args.mode == 'run_all':
         run_all(args, config)
     elif args.mode == 'bulk_insert':
-        run_bulk_insert(args, config)
+        run_safe_bulk_insert(args, config)
 
 
 if __name__ == '__main__':
