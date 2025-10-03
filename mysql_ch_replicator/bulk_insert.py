@@ -4,15 +4,12 @@ import argparse
 import logging
 import time
 import sys
-import os
+import mysql.connector
+import clickhouse_connect
 from dataclasses import dataclass
 from typing import Optional
 
 from .config import Settings
-from .mysql_api import MySQLApi
-from .clickhouse_api import ClickhouseApi
-from .converter import MysqlToClickhouseConverter
-from .table_structure import TableStructure
 
 
 @dataclass
@@ -34,46 +31,36 @@ class BulkInsertStats:
         return self.total_records_processed / elapsed if elapsed > 0 else 0
 
 
-class SafeBulkInserter:
+class HardcodedBulkInserter:
     """
-    Safe single-threaded bulk insert utility for MySQL to ClickHouse data migration.
-
-    This operates independently of the existing replication system and avoids
-    threading issues that can cause segmentation faults.
+    Hardcoded bulk insert utility that uses raw SQL without touching existing APIs.
+    Specifically designed for aggregated_stock_summary_wrapper table.
     """
 
-    DEFAULT_BATCH_SIZE = 50000
+    DEFAULT_BATCH_SIZE = 100000
 
-    def __init__(self, config: Settings, source_db: str, target_db: str, table_name: str,
-                 batch_size: int = DEFAULT_BATCH_SIZE, drop_existing: bool = False,
-                 resume: bool = True):
+    def __init__(self, config: Settings, source_db: str, target_db: str,
+                 batch_size: int = DEFAULT_BATCH_SIZE, resume: bool = True):
         self.config = config
         self.source_db = source_db
         self.target_db = target_db
-        self.table_name = table_name
         self.batch_size = batch_size
-        self.drop_existing = drop_existing
         self.resume = resume
-
-        # Initialize APIs
-        self.mysql_api = MySQLApi(database=source_db, mysql_settings=config.mysql)
-        self.clickhouse_api = ClickhouseApi(database=target_db, clickhouse_settings=config.clickhouse)
-
-        # Create converter instance (without db_replicator dependency for basic conversion)
-        self.converter = MysqlToClickhouseConverter()
-        self.converter.config = config  # Set config directly for type mappings
 
         # Statistics tracking
         self.stats = BulkInsertStats()
-
-        # Table structures
-        self.mysql_structure: Optional[TableStructure] = None
-        self.clickhouse_structure: Optional[TableStructure] = None
 
         # Resume position
         self.resume_position: Optional[tuple] = None
 
         self.logger = logging.getLogger(__name__)
+
+        # MySQL connection
+        self.mysql_conn = None
+        self.mysql_cursor = None
+
+        # ClickHouse connection
+        self.clickhouse_client = None
 
     def setup_logging(self, log_level: str = 'info'):
         """Setup logging for the bulk insert process."""
@@ -88,168 +75,177 @@ class SafeBulkInserter:
         level = log_levels.get(log_level.lower(), logging.INFO)
         logging.basicConfig(
             level=level,
-            format='[SAFE_BULK_INSERT %(asctime)s %(levelname)8s] %(message)s',
+            format='[HARDCODED_BULK_INSERT %(asctime)s %(levelname)8s] %(message)s',
             handlers=[logging.StreamHandler(sys.stderr)]
         )
 
-    def analyze_table_structure(self):
-        """Analyze source table structure and create ClickHouse equivalent."""
-        self.logger.info(f"Analyzing table structure for {self.source_db}.{self.table_name}")
+    def connect_mysql(self):
+        """Connect to MySQL"""
+        try:
+            self.mysql_conn = mysql.connector.connect(
+                host=self.config.mysql.host,
+                port=self.config.mysql.port,
+                user=self.config.mysql.user,
+                password=self.config.mysql.password,
+                database=self.source_db
+            )
+            self.mysql_cursor = self.mysql_conn.cursor()
+            self.logger.info("Connected to MySQL")
+        except Exception as e:
+            self.logger.error(f"Failed to connect to MySQL: {e}")
+            raise
 
-        # Get MySQL table structure
-        mysql_create_statement = self.mysql_api.get_table_create_statement(self.table_name)
-        self.mysql_structure = self.converter.parse_mysql_table_structure(
-            mysql_create_statement, required_table_name=self.table_name
+    def connect_clickhouse(self):
+        """Connect to ClickHouse"""
+        try:
+            self.clickhouse_client = clickhouse_connect.get_client(
+                host=self.config.clickhouse.host,
+                port=self.config.clickhouse.port,
+                username=self.config.clickhouse.user,
+                password=self.config.clickhouse.password,
+                connect_timeout=self.config.clickhouse.connection_timeout,
+                send_receive_timeout=self.config.clickhouse.send_receive_timeout,
+            )
+            self.logger.info("Connected to ClickHouse")
+        except Exception as e:
+            self.logger.error(f"Failed to connect to ClickHouse: {e}")
+            raise
+
+    def ensure_clickhouse_database_and_table(self):
+        """Ensure ClickHouse database and table exist"""
+        # Create database if not exists
+        self.clickhouse_client.command(f'CREATE DATABASE IF NOT EXISTS `{self.target_db}`')
+
+        # Create table if not exists
+        create_table_sql = f"""
+        CREATE TABLE IF NOT EXISTS `{self.target_db}`.`aggregated_stock_summary_wrapper`
+        (
+            code                           String,
+            pattern                        String,
+            transaction_date               Date32,
+            financial_year                 Int32,
+            item_code                      String,
+            warehouse_id                   Int64,
+            flock_id                       Nullable(Int64),
+            age                            Nullable(Float64),
+            chick_grade_id                 Nullable(Int64),
+            egg_grade_id                   Nullable(Int64),
+            production_date                Nullable(Date32),
+            opening_stock                  Float64,
+            closing_stock                  Float64,
+            total_purchased                Float64,
+            total_purchased_value          Float64,
+            total_received                 Float64,
+            total_received_value           Float64,
+            total_stock_adjusted_in        Float64,
+            total_stock_adjusted_in_value  Float64,
+            total_stock_adjusted_out       Float64,
+            total_stock_adjusted_out_value Float64,
+            total_sales_return             Float64,
+            total_sales_return_value       Float64,
+            total_produced                 Float64,
+            total_produced_value           Float64,
+            total_consumed                 Float64,
+            total_consumed_value           Float64,
+            total_transferred              Float64,
+            total_transferred_value        Float64,
+            total_sold                     Float64,
+            total_sold_value               Float64,
+            avg_unit_price                 Float64,
+            transactional                  Bool,
+            last_modified_date             DateTime64(6),
+            opening_rate                   Float64,
+            closing_rate                   Float64,
+            _version                       UInt64
         )
+        ENGINE = ReplacingMergeTree(_version)
+        ORDER BY (code, financial_year)
+        SETTINGS index_granularity = 8192
+        """
 
-        # Convert to ClickHouse structure
-        self.clickhouse_structure = self.converter.convert_table_structure(self.mysql_structure)
+        self.clickhouse_client.command(create_table_sql)
+        self.logger.info("ClickHouse table ensured")
 
-        self.logger.info(f"Table has {len(self.mysql_structure.fields)} fields")
-        self.logger.info(f"Primary keys: {self.mysql_structure.primary_keys}")
-
-        # Validate primary key exists
-        if not self.mysql_structure.primary_keys:
-            raise Exception(
-                f"Table {self.table_name} has no primary key. Bulk insert requires a primary key for ordering.")
-
-    def create_clickhouse_table(self):
-        """Create the target table in ClickHouse."""
-        self.logger.info(f"Creating ClickHouse table {self.target_db}.{self.table_name}")
-
-        # Ensure target database exists
-        if self.target_db not in self.clickhouse_api.get_databases():
-            self.logger.info(f"Creating target database: {self.target_db}")
-            self.clickhouse_api.create_database(self.target_db)
-
-        # Check if table already exists
-        existing_tables = self.clickhouse_api.get_tables()
-        table_exists = self.table_name in existing_tables
-
-        # Drop existing table if requested
-        if self.drop_existing and table_exists:
-            self.logger.info(f"Dropping existing table {self.target_db}.{self.table_name}")
-            self.clickhouse_api.execute_command(
-                f'DROP TABLE IF EXISTS `{self.target_db}`.`{self.table_name}`'
-            )
-            table_exists = False
-
-        # Create table if it doesn't exist
-        if not table_exists:
-            # Get any custom indexes/partitions from config
-            indexes = self.config.get_indexes(self.target_db, self.table_name)
-            partition_bys = self.config.get_partition_bys(self.target_db, self.table_name)
-
-            # Create table
-            self.clickhouse_structure.if_not_exists = True
-            self.clickhouse_api.create_table(
-                self.clickhouse_structure,
-                additional_indexes=indexes,
-                additional_partition_bys=partition_bys
-            )
-        else:
-            self.logger.info(f"Table {self.target_db}.{self.table_name} already exists")
-
-        # Determine resume position if resume is enabled
-        if self.resume and not self.drop_existing:
-            clickhouse_count = self.get_clickhouse_record_count()
-            if clickhouse_count > 0:
-                self.resume_position = self.get_resume_position()
-                self.logger.info(f"Found {clickhouse_count:,} existing records in ClickHouse")
-                if self.resume_position:
-                    self.logger.info(f"Will resume from position: {self.resume_position}")
-                else:
-                    self.logger.warning("Could not determine resume position, will start from beginning")
-            else:
-                self.logger.info("No existing records found in ClickHouse, starting from beginning")
-
-    def get_total_record_count(self) -> int:
-        """Get total number of records in source table."""
-        self.mysql_api.execute(f"SELECT COUNT(*) FROM `{self.table_name}`")
-        result = self.mysql_api.cursor.fetchone()
+    def get_total_mysql_records(self) -> int:
+        """Get total records in MySQL table"""
+        self.mysql_cursor.execute("SELECT COUNT(*) FROM aggregated_stock_summary_wrapper")
+        result = self.mysql_cursor.fetchone()
         return result[0] if result else 0
 
     def get_clickhouse_record_count(self) -> int:
-        """Get total number of records in target ClickHouse table."""
+        """Get total records in ClickHouse table"""
         try:
-            result = self.clickhouse_api.query(f"SELECT COUNT(*) FROM `{self.target_db}`.`{self.table_name}`")
+            result = self.clickhouse_client.query(
+                f"SELECT COUNT(*) FROM `{self.target_db}`.`aggregated_stock_summary_wrapper`")
             return result.result_rows[0][0] if result.result_rows else 0
         except Exception as e:
             self.logger.warning(f"Could not get ClickHouse record count: {e}")
             return 0
 
     def get_resume_position(self) -> Optional[tuple]:
-        """
-        Get the position to resume from based on existing ClickHouse records.
-        Returns the maximum primary key value from ClickHouse table.
-        """
+        """Get resume position from ClickHouse"""
+        if not self.resume:
+            return None
+
         try:
-            primary_keys = self.clickhouse_structure.primary_keys
-            if not primary_keys:
-                return None
-
-            # Build query to get max primary key values
-            if len(primary_keys) == 1:
-                query = f"SELECT MAX(`{primary_keys[0]}`) FROM `{self.target_db}`.`{self.table_name}`"
-            else:
-                # For composite primary keys, we need to get the maximum tuple
-                key_list = ', '.join(f'`{key}`' for key in primary_keys)
-                query = f"SELECT {key_list} FROM `{self.target_db}`.`{self.table_name}` ORDER BY {key_list} DESC LIMIT 1"
-
-            result = self.clickhouse_api.query(query)
-            if not result.result_rows or not result.result_rows[0] or result.result_rows[0][0] is None:
-                return None
-
-            if len(primary_keys) == 1:
-                return (result.result_rows[0][0],)
-            else:
+            result = self.clickhouse_client.query(
+                f"SELECT code, financial_year FROM `{self.target_db}`.`aggregated_stock_summary_wrapper` "
+                f"ORDER BY code, financial_year DESC LIMIT 1"
+            )
+            if result.result_rows:
                 return tuple(result.result_rows[0])
-
+            return None
         except Exception as e:
             self.logger.warning(f"Could not determine resume position: {e}")
             return None
 
-    def process_batch(self, start_value: Optional[tuple] = None) -> tuple[int, Optional[tuple]]:
-        """
-        Process a single batch of records.
-
-        Returns:
-            tuple: (records_processed, last_primary_key_value)
-        """
+    def process_batch(self, offset: int) -> int:
+        """Process a batch using LIMIT/OFFSET"""
         try:
-            # Get records for this batch
-            records = self.mysql_api.get_records(
-                table_name=self.table_name,
-                order_by=self.mysql_structure.primary_keys,
-                limit=self.batch_size,
-                start_value=start_value,
-                worker_id=None,  # Single-threaded
-                total_workers=None
-            )
+            # Use simple LIMIT/OFFSET to avoid WHERE clause issues
+            query = f"""
+            SELECT 
+                code, pattern, transaction_date, financial_year, item_code, warehouse_id,
+                flock_id, age, chick_grade_id, egg_grade_id, production_date,
+                opening_stock, closing_stock, total_purchased, total_purchased_value,
+                total_received, total_received_value, total_stock_adjusted_in, total_stock_adjusted_in_value,
+                total_stock_adjusted_out, total_stock_adjusted_out_value, total_sales_return, total_sales_return_value,
+                total_produced, total_produced_value, total_consumed, total_consumed_value,
+                total_transferred, total_transferred_value, total_sold, total_sold_value,
+                avg_unit_price, transactional, last_modified_date, opening_rate, closing_rate
+            FROM aggregated_stock_summary_wrapper 
+            ORDER BY code, financial_year 
+            LIMIT {self.batch_size} OFFSET {offset}
+            """
+
+            self.mysql_cursor.execute(query)
+            records = self.mysql_cursor.fetchall()
 
             if not records:
-                return 0, None
+                return 0
 
-            # Convert records to ClickHouse format
-            converted_records = self.converter.convert_records(
-                records, self.mysql_structure, self.clickhouse_structure
+            # Get current version for ClickHouse
+            current_version = int(time.time() * 1000000)  # microsecond timestamp
+
+            # Prepare data for ClickHouse insert
+            clickhouse_records = []
+            for record in records:
+                # Convert MySQL record to ClickHouse format
+                ch_record = list(record)
+                ch_record.append(current_version)  # Add _version
+                current_version += 1
+                clickhouse_records.append(tuple(ch_record))
+
+            # Insert into ClickHouse
+            self.clickhouse_client.insert(
+                f'`{self.target_db}`.`aggregated_stock_summary_wrapper`',
+                clickhouse_records
             )
 
-            # Insert to ClickHouse
-            self.clickhouse_api.insert(
-                self.table_name, converted_records, table_structure=self.clickhouse_structure
-            )
-
-            # Get the last primary key value for continuation
-            last_record = records[-1]
-            primary_key_ids = self.mysql_structure.primary_key_ids
-            last_primary_key = tuple(last_record[idx] for idx in primary_key_ids)
-
-            return len(records), last_primary_key
+            return len(records)
 
         except Exception as e:
-            self.logger.error(f"Batch processing error: {e}")
-            self.stats.errors += 1
+            self.logger.error(f"Batch processing error at offset {offset}: {e}")
             raise
 
     def update_stats(self, records_processed: int):
@@ -273,14 +269,12 @@ class SafeBulkInserter:
         self.logger.info(
             f"Progress: {self.stats.total_records_processed:,}/{total_records:,} records "
             f"({progress_pct:.1f}%) | {self.stats.total_batches_processed:,} batches | "
-            f"{rps:,.0f} records/sec | ETA: {eta_str} | Errors: {self.stats.errors}"
+            f"{rps:,.0f} records/sec | ETA: {eta_str}"
         )
 
-    def run_single_threaded_insert(self):
-        """Run bulk insert with single thread (safe and reliable)."""
-        self.logger.info(f"Starting single-threaded bulk insert, batch size {self.batch_size}")
-
-        total_records = self.get_total_record_count()
+    def run_bulk_insert(self):
+        """Run the bulk insert using LIMIT/OFFSET approach"""
+        total_records = self.get_total_mysql_records()
         clickhouse_records = self.get_clickhouse_record_count()
 
         self.logger.info(f"MySQL records: {total_records:,}")
@@ -290,33 +284,33 @@ class SafeBulkInserter:
             self.logger.info("ClickHouse already has all records, nothing to process")
             return
 
-        estimated_remaining = total_records - clickhouse_records
-        self.logger.info(f"Estimated records to process: {estimated_remaining:,}")
+        # Start from where ClickHouse left off
+        start_offset = clickhouse_records
 
-        start_value = self.resume_position
+        self.logger.info(f"Starting from offset: {start_offset:,}")
+        self.logger.info(f"Estimated records to process: {total_records - start_offset:,}")
+
+        offset = start_offset
         last_log_time = time.time()
 
-        while True:
+        while offset < total_records:
             try:
-                records_processed, last_primary_key = self.process_batch(start_value)
+                records_processed = self.process_batch(offset)
 
                 if records_processed == 0:
                     break
 
                 self.update_stats(records_processed)
-                start_value = last_primary_key
+                offset += records_processed
 
                 # Log progress every 30 seconds
                 if time.time() - last_log_time > 30:
                     self.log_progress(total_records)
                     last_log_time = time.time()
 
-                # Check if we should continue
-                if records_processed < self.batch_size:
-                    break
-
             except Exception as e:
                 self.logger.error(f"Batch processing error: {e}")
+                self.stats.errors += 1
                 if self.stats.errors > 10:
                     raise Exception("Too many errors, stopping bulk insert")
                 time.sleep(1)
@@ -335,24 +329,20 @@ class SafeBulkInserter:
         self.logger.info(f"Total time: {elapsed:.1f} seconds")
         self.logger.info(f"Average rate: {rps:,.0f} records/second")
         self.logger.info(f"Errors: {self.stats.errors}")
-        if self.stats.total_records_processed != total_records:
-            self.logger.warning(f"Expected {total_records:,} records, processed {self.stats.total_records_processed:,}")
         self.logger.info("=" * 60)
 
     def run(self):
         """Main execution method."""
         try:
             self.logger.info(
-                f"Starting bulk insert: {self.source_db}.{self.table_name} -> {self.target_db}.{self.table_name}")
+                f"Starting hardcoded bulk insert: {self.source_db}.aggregated_stock_summary_wrapper -> {self.target_db}.aggregated_stock_summary_wrapper")
 
-            # Analyze source table
-            self.analyze_table_structure()
+            # Connect to databases
+            self.connect_mysql()
+            self.connect_clickhouse()
 
-            # Create target table
-            self.create_clickhouse_table()
-
-            # Run single-threaded insert
-            self.run_single_threaded_insert()
+            # Run bulk insert
+            self.run_bulk_insert()
 
             self.logger.info("Bulk insert completed successfully!")
 
@@ -361,16 +351,15 @@ class SafeBulkInserter:
             raise
         finally:
             # Cleanup
-            if hasattr(self, 'mysql_api') and self.mysql_api:
-                try:
-                    self.mysql_api.close()
-                except:
-                    pass  # Ignore cleanup errors
+            if self.mysql_cursor:
+                self.mysql_cursor.close()
+            if self.mysql_conn:
+                self.mysql_conn.close()
 
 
 # Function to be called from main.py
-def run_safe_bulk_insert(args, config: Settings):
-    """Entry point for safe bulk insert when called from main.py"""
+def run_hardcoded_bulk_insert(args, config: Settings):
+    """Entry point for hardcoded bulk insert when called from main.py"""
     # Use source_db if provided, otherwise fall back to db
     source_db = getattr(args, 'source_db', None) or args.db
     if not source_db:
@@ -379,63 +368,18 @@ def run_safe_bulk_insert(args, config: Settings):
     # Use target_db if provided, otherwise use same as source_db
     target_db = args.target_db or source_db
 
-    if not args.table:
-        raise Exception("--table argument is required for bulk_insert mode")
-
     # Set up logging
-    log_tag = f'safe_bulk_insert {source_db}.{args.table}'
+    log_tag = f'hardcoded_bulk_insert {source_db}.aggregated_stock_summary_wrapper'
     from .main import set_logging_config
     set_logging_config(log_tag, log_level_str=config.log_level)
 
     # Create and run bulk inserter
-    inserter = SafeBulkInserter(
+    inserter = HardcodedBulkInserter(
         config=config,
         source_db=source_db,
         target_db=target_db,
-        table_name=args.table,
-        batch_size=getattr(args, 'batch_size', SafeBulkInserter.DEFAULT_BATCH_SIZE),
-        drop_existing=getattr(args, 'drop_existing', False),
+        batch_size=getattr(args, 'batch_size', HardcodedBulkInserter.DEFAULT_BATCH_SIZE),
         resume=not getattr(args, 'no_resume', False)
     )
 
     inserter.run()
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Safe bulk insert utility for MySQL to ClickHouse")
-    parser.add_argument("--config", required=True, help="Config file path")
-    parser.add_argument("--source-db", required=True, help="Source MySQL database name")
-    parser.add_argument("--target-db", required=True, help="Target ClickHouse database name")
-    parser.add_argument("--table", required=True, help="Table name to bulk insert")
-    parser.add_argument("--batch-size", type=int, default=SafeBulkInserter.DEFAULT_BATCH_SIZE,
-                        help=f"Batch size for processing (default: {SafeBulkInserter.DEFAULT_BATCH_SIZE})")
-    parser.add_argument("--drop-existing", action="store_true",
-                        help="Drop existing table in ClickHouse before creating")
-    parser.add_argument("--no-resume", action="store_true",
-                        help="Don't resume from existing records, start from beginning")
-    parser.add_argument("--log-level", default="info", choices=['debug', 'info', 'warning', 'error'],
-                        help="Logging level (default: info)")
-
-    args = parser.parse_args()
-
-    # Load configuration
-    config = Settings()
-    config.load(args.config)
-
-    # Create and run bulk inserter
-    inserter = SafeBulkInserter(
-        config=config,
-        source_db=args.source_db,
-        target_db=args.target_db,
-        table_name=args.table,
-        batch_size=args.batch_size,
-        drop_existing=args.drop_existing,
-        resume=not args.no_resume
-    )
-
-    inserter.setup_logging(args.log_level)
-    inserter.run()
-
-
-if __name__ == '__main__':
-    main()

@@ -7,3 +7,5 @@ python -m mysql_ch_replicator bulk_insert \
   --table aggregated_stock_summary_wrapper
   --threads 1
   --batch_size 100000
+
+mysql_ch_replicator bulk_insert --config config.yaml --db lifeline_prod --target_db lifeline_insights_prod --table aggregated_stock_summary_wrapper --batch_size 100000
