@@ -10,7 +10,6 @@ from .utils import GracefulKiller, touch_all_files, format_floats
 from .converter import strip_sql_comments
 from .common import Status
 
-
 logger = getLogger(__name__)
 
 
@@ -25,7 +24,7 @@ class DbReplicatorRealtime:
 
     def __init__(self, replicator):
         self.replicator = replicator
-        
+
         # Initialize internal state
         self.records_to_insert = defaultdict(dict)  # table_name => {record_id=>record, ...}
         self.records_to_delete = defaultdict(set)  # table_name => {record_id, ...}
@@ -45,8 +44,9 @@ class DbReplicatorRealtime:
         if self.replicator.mysql_api:
             self.replicator.mysql_api.close()
             self.replicator.mysql_api = None
-            
-        logger.info(f'running realtime replication from the position: {self.replicator.state.last_processed_transaction}')
+
+        logger.info(
+            f'running realtime replication from the position: {self.replicator.state.last_processed_transaction}')
         self.replicator.state.status = Status.RUNNING_REALTIME_REPLICATION
         self.replicator.state.save()
         self.replicator.data_reader.set_position(self.replicator.state.last_processed_transaction)
@@ -132,7 +132,8 @@ class DbReplicatorRealtime:
 
         mysql_table_structure = self.replicator.state.tables_structure[event.table_name][0]
         clickhouse_table_structure = self.replicator.state.tables_structure[event.table_name][1]
-        records = self.replicator.converter.convert_records(event.records, mysql_table_structure, clickhouse_table_structure)
+        records = self.replicator.converter.convert_records(event.records, mysql_table_structure,
+                                                            clickhouse_table_structure)
 
         current_table_records_to_insert = self.records_to_insert[event.table_name]
         current_table_records_to_delete = self.records_to_delete[event.table_name]
@@ -148,7 +149,7 @@ class DbReplicatorRealtime:
                 f'table: {event.table_name}, '
                 f'records: {event.records}',
             )
-        
+
         # If ignore_deletes is enabled, skip processing delete events
         if self.replicator.config.ignore_deletes:
             if self.replicator.config.debug_log_level:
@@ -158,7 +159,7 @@ class DbReplicatorRealtime:
                     f'records: {len(event.records)}',
                 )
             return
-            
+
         self.replicator.stats.erase_events_count += 1
         self.replicator.stats.erase_records_count += len(event.records)
 
@@ -205,7 +206,20 @@ class DbReplicatorRealtime:
         self.replicator.state.tables_structure[mysql_structure.table_name] = (mysql_structure, ch_structure)
         indexes = self.replicator.config.get_indexes(self.replicator.database, ch_structure.table_name)
         partition_bys = self.replicator.config.get_partition_bys(self.replicator.database, ch_structure.table_name)
-        self.replicator.clickhouse_api.create_table(ch_structure, additional_indexes=indexes, additional_partition_bys=partition_bys)
+        try:
+            self.replicator.clickhouse_api.create_table(ch_structure, additional_indexes=indexes,
+                                                        additional_partition_bys=partition_bys)
+        except Exception as e:
+            # Check if this is a TABLE_ALREADY_EXISTS error (code 57)
+            if 'TABLE_ALREADY_EXISTS' in str(e) or 'table already exists' in str(e).lower():
+                logger.warning(
+                    f'Table {ch_structure.table_name} already exists in ClickHouse, skipping CREATE TABLE operation')
+                # Table exists in ClickHouse but not in our state - update state
+                # State was already updated above, so we're good
+                return
+            else:
+                # Some other error - re-raise it
+                raise
 
     def handle_drop_table_query(self, query, db_name):
         tokens = query.split()
@@ -213,8 +227,8 @@ class DbReplicatorRealtime:
             raise Exception('wrong drop table query', query)
 
         if_exists = (len(tokens) > 4 and
-                tokens[2].lower() == 'if' and
-                tokens[3].lower() == 'exists')
+                     tokens[2].lower() == 'if' and
+                     tokens[3].lower() == 'exists')
         if if_exists:
             del tokens[2:4]  # Remove the 'IF', 'EXISTS' tokens
 
@@ -227,7 +241,18 @@ class DbReplicatorRealtime:
 
         if table_name in self.replicator.state.tables_structure:
             self.replicator.state.tables_structure.pop(table_name)
-        self.replicator.clickhouse_api.execute_command(f'DROP TABLE {"IF EXISTS" if if_exists else ""} `{db_name}`.`{table_name}`')
+
+        try:
+            self.replicator.clickhouse_api.execute_command(
+                f'DROP TABLE {"IF EXISTS" if if_exists else ""} `{db_name}`.`{table_name}`')
+        except Exception as e:
+            # Check if this is a "table doesn't exist" error
+            if 'unknown table' in str(e).lower() or 'doesn\'t exist' in str(e).lower():
+                logger.warning(f'Table {table_name} does not exist in ClickHouse, skipping DROP TABLE operation')
+                return
+            else:
+                # Some other error - re-raise it
+                raise
 
     def handle_rename_table_query(self, query, db_name):
         tokens = query.split()
@@ -243,7 +268,8 @@ class DbReplicatorRealtime:
             if tokens[1].lower() != 'to':
                 raise Exception('"to" keyword expected', query)
 
-            src_db_name, src_table_name, matches_config = self.replicator.converter.get_db_and_table_name(tokens[0], db_name)
+            src_db_name, src_table_name, matches_config = self.replicator.converter.get_db_and_table_name(tokens[0],
+                                                                                                          db_name)
             dest_db_name, dest_table_name, _ = self.replicator.converter.get_db_and_table_name(tokens[2], db_name)
             if not matches_config:
                 return
@@ -251,10 +277,21 @@ class DbReplicatorRealtime:
             if src_db_name != self.replicator.target_database or dest_db_name != self.replicator.target_database:
                 raise Exception('cross databases table renames not implemented', tokens)
             if src_table_name in self.replicator.state.tables_structure:
-                self.replicator.state.tables_structure[dest_table_name] = self.replicator.state.tables_structure.pop(src_table_name)
+                self.replicator.state.tables_structure[dest_table_name] = self.replicator.state.tables_structure.pop(
+                    src_table_name)
 
             ch_clauses.append(f"`{src_db_name}`.`{src_table_name}` TO `{dest_db_name}`.`{dest_table_name}`")
-        self.replicator.clickhouse_api.execute_command(f'RENAME TABLE {", ".join(ch_clauses)}')
+
+        try:
+            self.replicator.clickhouse_api.execute_command(f'RENAME TABLE {", ".join(ch_clauses)}')
+        except Exception as e:
+            # Check if this is a "table doesn't exist" error
+            if 'unknown table' in str(e).lower() or 'doesn\'t exist' in str(e).lower():
+                logger.warning(f'Source table does not exist in ClickHouse, skipping RENAME TABLE operation')
+                return
+            else:
+                # Some other error - re-raise it
+                raise
 
     def handle_truncate_query(self, query, db_name):
         """Handle TRUNCATE TABLE operations by clearing data in ClickHouse"""
@@ -291,7 +328,16 @@ class DbReplicatorRealtime:
 
         # Execute TRUNCATE on ClickHouse
         logger.info(f'Executing TRUNCATE on ClickHouse table: {db_name}.{table_name}')
-        self.replicator.clickhouse_api.execute_command(f'TRUNCATE TABLE `{db_name}`.`{table_name}`')
+        try:
+            self.replicator.clickhouse_api.execute_command(f'TRUNCATE TABLE `{db_name}`.`{table_name}`')
+        except Exception as e:
+            # Check if this is a "table doesn't exist" error
+            if 'unknown table' in str(e).lower() or 'doesn\'t exist' in str(e).lower():
+                logger.warning(f'Table {table_name} does not exist in ClickHouse, skipping TRUNCATE TABLE operation')
+                return
+            else:
+                # Some other error - re-raise it
+                raise
 
     def log_stats_if_required(self):
         curr_time = time.time()
