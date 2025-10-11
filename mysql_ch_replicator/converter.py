@@ -14,12 +14,11 @@ from .enum import (
     extract_enum_or_set_values
 )
 
-
 CHARSET_MYSQL_TO_PYTHON = {
-    'armscii8': None,          # ARMSCII-8 is not directly supported in Python
+    'armscii8': None,  # ARMSCII-8 is not directly supported in Python
     'ascii': 'ascii',
     'big5': 'big5',
-    'binary': 'latin1',        # Treat binary data as Latin-1 in Python
+    'binary': 'latin1',  # Treat binary data as Latin-1 in Python
     'cp1250': 'cp1250',
     'cp1251': 'cp1251',
     'cp1256': 'cp1256',
@@ -28,34 +27,34 @@ CHARSET_MYSQL_TO_PYTHON = {
     'cp852': 'cp852',
     'cp866': 'cp866',
     'cp932': 'cp932',
-    'dec8': 'latin1',          # DEC8 is similar to Latin-1
-    'eucjpms': 'euc_jp',       # Map to EUC-JP
+    'dec8': 'latin1',  # DEC8 is similar to Latin-1
+    'eucjpms': 'euc_jp',  # Map to EUC-JP
     'euckr': 'euc_kr',
     'gb18030': 'gb18030',
     'gb2312': 'gb2312',
     'gbk': 'gbk',
-    'geostd8': None,           # GEOSTD8 is not directly supported in Python
+    'geostd8': None,  # GEOSTD8 is not directly supported in Python
     'greek': 'iso8859_7',
     'hebrew': 'iso8859_8',
-    'hp8': None,               # HP8 is not directly supported in Python
-    'keybcs2': None,           # KEYBCS2 is not directly supported in Python
+    'hp8': None,  # HP8 is not directly supported in Python
+    'keybcs2': None,  # KEYBCS2 is not directly supported in Python
     'koi8r': 'koi8_r',
     'koi8u': 'koi8_u',
-    'latin1': 'latin1',        # MySQL's latin1 corresponds to Windows-1252
+    'latin1': 'latin1',  # MySQL's latin1 corresponds to Windows-1252
     'latin2': 'iso8859_2',
     'latin5': 'iso8859_9',
     'latin7': 'iso8859_13',
     'macce': 'mac_latin2',
     'macroman': 'mac_roman',
     'sjis': 'shift_jis',
-    'swe7': None,              # SWE7 is not directly supported in Python
+    'swe7': None,  # SWE7 is not directly supported in Python
     'tis620': 'tis_620',
-    'ucs2': 'utf_16',          # UCS-2 can be mapped to UTF-16
+    'ucs2': 'utf_16',  # UCS-2 can be mapped to UTF-16
     'ujis': 'euc_jp',
     'utf16': 'utf_16',
     'utf16le': 'utf_16_le',
     'utf32': 'utf_32',
-    'utf8mb3': 'utf_8',        # Both utf8mb3 and utf8mb4 can be mapped to UTF-8
+    'utf8mb3': 'utf_8',  # Both utf8mb3 and utf8mb4 can be mapped to UTF-8
     'utf8mb4': 'utf_8',
     'utf8': 'utf_8',
 }
@@ -172,7 +171,7 @@ def parse_mysql_polygon(binary):
     ring_offset = offset + 9
     num_points = struct.unpack(endian + 'I', binary[ring_offset:ring_offset + 4])[0]
     points = []
-    
+
     # Read each point in the ring
     for i in range(num_points):
         point_offset = ring_offset + 4 + (i * 16)  # 16 bytes per point (8 for x, 8 for y)
@@ -216,7 +215,6 @@ def strip_sql_comments(sql_statement):
 
 
 def convert_timestamp_to_datetime64(input_str, timezone='UTC'):
-
     # Define the regex pattern
     pattern = r'^timestamp(?:\((\d+)\))?$'
 
@@ -350,7 +348,7 @@ class MysqlToClickhouseConverter:
             enum_values = parse_mysql_enum(mysql_type)
             ch_enum_values = []
             for idx, value_name in enumerate(enum_values):
-                ch_enum_values.append(f"'{value_name.lower()}' = {idx+1}")
+                ch_enum_values.append(f"'{value_name.lower()}' = {idx + 1}")
             ch_enum_values = ', '.join(ch_enum_values)
             if len(enum_values) <= 127:
                 # Enum8('red' = 1, 'green' = 2, 'black' = 3)
@@ -532,9 +530,9 @@ class MysqlToClickhouseConverter:
             if mysql_field_type.startswith('enum('):
                 enum_values = mysql_structure.fields[idx].additional_data
                 field_name = mysql_structure.fields[idx].name if idx < len(mysql_structure.fields) else "unknown"
-                
+
                 clickhouse_field_value = EnumConverter.convert_mysql_to_clickhouse_enum(
-                    clickhouse_field_value, 
+                    clickhouse_field_value,
                     enum_values,
                     field_name
                 )
@@ -561,7 +559,7 @@ class MysqlToClickhouseConverter:
         if mysql_query.find(';') != -1:
             raise Exception('multi-query statement not supported')
         return mysql_query
-    
+
     def get_db_and_table_name(self, token, db_name):
         if '.' in token:
             db_name, table_name = token.split('.')
@@ -576,14 +574,14 @@ class MysqlToClickhouseConverter:
             if '.' not in token and self.db_replicator.target_database == db_name:
                 # This is a target database name, so for config matching we need to use the source database
                 matches_config = (
-                    self.db_replicator.config.is_database_matches(self.db_replicator.database)
-                    and self.db_replicator.config.is_table_matches(table_name))
+                        self.db_replicator.config.is_database_matches(self.db_replicator.database)
+                        and self.db_replicator.config.is_table_matches(table_name))
             else:
                 # Normal case: check if source database and table match config
                 matches_config = (
-                    self.db_replicator.config.is_database_matches(db_name)
-                    and self.db_replicator.config.is_table_matches(table_name))
-            
+                        self.db_replicator.config.is_database_matches(db_name)
+                        and self.db_replicator.config.is_table_matches(table_name))
+
             # Apply database mapping AFTER checking matches_config
             if db_name == self.db_replicator.database:
                 db_name = self.db_replicator.target_database
@@ -753,11 +751,16 @@ class MysqlToClickhouseConverter:
             mysql_table_structure: TableStructure = table_structure[0]
             ch_table_structure: TableStructure = table_structure[1]
 
+            # Check if column already exists in ClickHouse structure
+            if ch_table_structure.has_field(column_name):
+                logger.info(f'Column {column_name} already exists in table {table_name}, skipping ADD COLUMN operation')
+                return
+
             if column_first:
                 mysql_table_structure.add_field_first(
                     TableField(name=column_name, field_type=column_type_mysql)
                 )
-                
+
                 ch_table_structure.add_field_first(
                     TableField(name=column_name, field_type=column_type_ch)
                 )
@@ -796,6 +799,12 @@ class MysqlToClickhouseConverter:
             mysql_table_structure: TableStructure = table_structure[0]
             ch_table_structure: TableStructure = table_structure[1]
 
+            # Check if column exists before trying to drop it
+            if not ch_table_structure.has_field(column_name):
+                logger.info(
+                    f'Column {column_name} does not exist in table {table_name}, skipping DROP COLUMN operation')
+                return
+
             mysql_table_structure.remove_field(field_name=column_name)
             ch_table_structure.remove_field(field_name=column_name)
 
@@ -818,6 +827,13 @@ class MysqlToClickhouseConverter:
             table_structure = self.db_replicator.state.tables_structure[table_name]
             mysql_table_structure: TableStructure = table_structure[0]
             ch_table_structure: TableStructure = table_structure[1]
+
+            # Check if column exists and already has the correct type
+            existing_field = ch_table_structure.get_field(column_name)
+            if existing_field and existing_field.field_type == column_type_ch:
+                logger.info(
+                    f'Column {column_name} already has type {column_type_ch} in table {table_name}, skipping MODIFY COLUMN operation')
+                return
 
             mysql_table_structure.update_field(
                 TableField(name=column_name, field_type=column_type_mysql),
@@ -851,7 +867,6 @@ class MysqlToClickhouseConverter:
             current_column_type_ch = ch_table_structure.get_field(column_name).field_type
 
             if current_column_type_ch != column_type_ch:
-
                 mysql_table_structure.update_field(
                     TableField(name=column_name, field_type=column_type_mysql),
                 )
@@ -880,41 +895,41 @@ class MysqlToClickhouseConverter:
         """
         if len(tokens) < 3:
             raise Exception('wrong tokens count for RENAME COLUMN', tokens)
-        
+
         # Extract old and new column names
         old_column_name = strip_sql_name(tokens[0])
-        
+
         # Check if the second token is "TO" (standard syntax)
         if tokens[1].lower() != 'to':
             raise Exception('expected TO keyword in RENAME COLUMN syntax', tokens)
-        
+
         new_column_name = strip_sql_name(tokens[2])
-        
+
         # Update table structure
         if self.db_replicator:
             if table_name in self.db_replicator.state.tables_structure:
                 table_structure = self.db_replicator.state.tables_structure[table_name]
                 mysql_table_structure: TableStructure = table_structure[0]
                 ch_table_structure: TableStructure = table_structure[1]
-                
+
                 # Update field name in MySQL structure
                 mysql_field = mysql_table_structure.get_field(old_column_name)
                 if mysql_field:
                     mysql_field.name = new_column_name
                 else:
                     raise Exception(f'Column {old_column_name} not found in MySQL structure')
-                
+
                 # Update field name in ClickHouse structure
                 ch_field = ch_table_structure.get_field(old_column_name)
                 if ch_field:
                     ch_field.name = new_column_name
                 else:
                     raise Exception(f'Column {old_column_name} not found in ClickHouse structure')
-                
+
                 # Preprocess to update primary key IDs if the renamed column is part of the primary key
                 mysql_table_structure.preprocess()
                 ch_table_structure.preprocess()
-            
+
         # Execute the RENAME COLUMN command in ClickHouse
         query = f'ALTER TABLE `{db_name}`.`{table_name}` RENAME COLUMN `{old_column_name}` TO `{new_column_name}`'
         if self.db_replicator:
@@ -923,66 +938,66 @@ class MysqlToClickhouseConverter:
     def _handle_create_table_like(self, create_statement, source_table_name, target_table_name, is_query_api=True):
         """
         Helper method to handle CREATE TABLE LIKE statements.
-        
+
         Args:
             create_statement: The original CREATE TABLE LIKE statement
             source_table_name: Name of the source table being copied
             target_table_name: Name of the new table being created
             is_query_api: If True, returns both MySQL and CH structures; if False, returns only MySQL structure
-            
+
         Returns:
             Either (mysql_structure, ch_structure) if is_query_api=True, or just mysql_structure otherwise
         """
         # Try to get the actual structure from the existing table structures first
-        if (hasattr(self, 'db_replicator') and 
-            self.db_replicator is not None and 
-            hasattr(self.db_replicator, 'state') and
-            hasattr(self.db_replicator.state, 'tables_structure')):
-            
+        if (hasattr(self, 'db_replicator') and
+                self.db_replicator is not None and
+                hasattr(self.db_replicator, 'state') and
+                hasattr(self.db_replicator.state, 'tables_structure')):
+
             # Check if the source table structure is already in our state
             if source_table_name in self.db_replicator.state.tables_structure:
                 # Get the existing structure
                 source_mysql_structure, source_ch_structure = self.db_replicator.state.tables_structure[source_table_name]
-                
+
                 # Create a new structure with the target table name
                 new_mysql_structure = copy.deepcopy(source_mysql_structure)
                 new_mysql_structure.table_name = target_table_name
-                
-                # Convert to ClickHouse structure 
+
+                # Convert to ClickHouse structure
                 new_ch_structure = copy.deepcopy(source_ch_structure)
                 new_ch_structure.table_name = target_table_name
-                
+
                 return (new_mysql_structure, new_ch_structure) if is_query_api else new_mysql_structure
-        
+
         # If we couldn't get it from state, try with MySQL API
-        if (hasattr(self, 'db_replicator') and 
-            self.db_replicator is not None and 
-            hasattr(self.db_replicator, 'mysql_api') and 
-            self.db_replicator.mysql_api is not None):
-            
+        if (hasattr(self, 'db_replicator') and
+                self.db_replicator is not None and
+                hasattr(self.db_replicator, 'mysql_api') and
+                self.db_replicator.mysql_api is not None):
+
             try:
                 # Get the CREATE statement for the source table
                 source_create_statement = self.db_replicator.mysql_api.get_table_create_statement(source_table_name)
-                
+
                 # Parse the source table structure
                 source_structure = self.parse_mysql_table_structure(source_create_statement)
-                
+
                 # Copy the structure but keep the new table name
                 mysql_structure = copy.deepcopy(source_structure)
                 mysql_structure.table_name = target_table_name
-                
+
                 if is_query_api:
                     # Convert to ClickHouse structure
                     ch_structure = self.convert_table_structure(mysql_structure)
                     return mysql_structure, ch_structure
                 else:
                     return mysql_structure
-                    
+
             except Exception as e:
                 error_msg = f"Could not get source table structure for LIKE statement: {str(e)}"
                 print(f"Error: {error_msg}")
                 raise Exception(error_msg, create_statement)
-        
+
         # If we got here, we couldn't determine the structure
         raise Exception(f"Could not determine structure for source table '{source_table_name}' in LIKE statement", create_statement)
 
@@ -992,12 +1007,12 @@ class MysqlToClickhouseConverter:
             # Check if this is a CREATE TABLE LIKE statement using regex
             create_like_pattern = r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[`"]?([^`"\s]+)[`"]?\s+LIKE\s+[`"]?([^`"\s]+)[`"]?'
             match = re.search(create_like_pattern, mysql_query, re.IGNORECASE)
-            
+
             if match:
                 # This is a CREATE TABLE LIKE statement
                 new_table_name = match.group(1).strip('`"')
                 source_table_name = match.group(2).strip('`"')
-                
+
                 # Use the common helper method to handle the LIKE statement
                 return self._handle_create_table_like(mysql_query, source_table_name, new_table_name, True)
 
@@ -1050,17 +1065,17 @@ class MysqlToClickhouseConverter:
             # Extract the source table name
             if not isinstance(tokens[4], sqlparse.sql.Identifier):
                 raise Exception('wrong create statement', create_statement)
-            
+
             source_table_name = strip_sql_name(tokens[4].get_real_name())
             target_table_name = strip_sql_name(tokens[2].get_real_name())
-            
+
             # Use the common helper method to handle the LIKE statement
             return self._handle_create_table_like(create_statement, source_table_name, target_table_name, False)
 
         if not isinstance(tokens[3], sqlparse.sql.Parenthesis):
             raise Exception('wrong create statement', create_statement)
 
-        #print(' --- processing statement:\n', create_statement, '\n')
+        # print(' --- processing statement:\n', create_statement, '\n')
 
         inner_tokens = tokens[3].tokens
         inner_tokens = ''.join([str(t) for t in inner_tokens[1:-1]]).strip()
@@ -1124,7 +1139,7 @@ class MysqlToClickhouseConverter:
             if line.startswith('`'):
                 end_pos = line.find('`', 1)
                 field_name = line[1:end_pos]
-                line = line[end_pos + 1 :].strip()
+                line = line[end_pos + 1:].strip()
                 # Use our new enum parsing utilities
                 field_name, field_type, field_parameters = parse_enum_or_set_field(line, field_name, is_backtick_quoted=True)
             else:
@@ -1142,7 +1157,7 @@ class MysqlToClickhouseConverter:
                 parameters=field_parameters,
                 additional_data=additional_data,
             ))
-            #print(' ---- params:', field_parameters)
+            # print(' ---- params:', field_parameters)
 
 
         if not structure.primary_keys:
