@@ -785,7 +785,18 @@ class MysqlToClickhouseConverter:
             query += f' AFTER {column_after}'
 
         if self.db_replicator:
-            self.db_replicator.clickhouse_api.execute_command(query)
+            try:
+                self.db_replicator.clickhouse_api.execute_command(query)
+            except Exception as e:
+                # Check if this is a DUPLICATE_COLUMN error (code 15)
+                if 'DUPLICATE_COLUMN' in str(e) or 'column with this name already exists' in str(e).lower():
+                    logger.warning(
+                        f'Column {column_name} already exists in ClickHouse table {table_name}, skipping ADD COLUMN operation')
+                    # Column exists in ClickHouse but not in our state - this is OK, state will be updated
+                    return
+                else:
+                    # Some other error - re-raise it
+                    raise
 
     def __convert_alter_table_drop_column(self, db_name, table_name, tokens):
         if len(tokens) != 1:
@@ -810,7 +821,17 @@ class MysqlToClickhouseConverter:
 
         query = f'ALTER TABLE `{db_name}`.`{table_name}` DROP COLUMN {column_name}'
         if self.db_replicator:
-            self.db_replicator.clickhouse_api.execute_command(query)
+            try:
+                self.db_replicator.clickhouse_api.execute_command(query)
+            except Exception as e:
+                # Check if this is a "column doesn't exist" error
+                if 'no such column' in str(e).lower() or 'unknown identifier' in str(e).lower():
+                    logger.warning(
+                        f'Column {column_name} does not exist in ClickHouse table {table_name}, skipping DROP COLUMN operation')
+                    return
+                else:
+                    # Some other error - re-raise it
+                    raise
 
     def __convert_alter_table_modify_column(self, db_name, table_name, tokens):
         if len(tokens) < 2:
@@ -845,7 +866,16 @@ class MysqlToClickhouseConverter:
 
         query = f'ALTER TABLE `{db_name}`.`{table_name}` MODIFY COLUMN `{column_name}` {column_type_ch}'
         if self.db_replicator:
-            self.db_replicator.clickhouse_api.execute_command(query)
+            try:
+                self.db_replicator.clickhouse_api.execute_command(query)
+            except Exception as e:
+                # Log the error but don't crash - the column type might already be correct
+                logger.warning(f'Error modifying column {column_name} in table {table_name}: {e}')
+                # Re-raise if it's not a benign error
+                if 'no such column' in str(e).lower():
+                    raise
+                # For other errors, we'll log but continue
+                logger.info(f'Continuing despite MODIFY COLUMN error for {column_name}')
 
     def __convert_alter_table_change_column(self, db_name, table_name, tokens):
         if len(tokens) < 3:
@@ -864,9 +894,16 @@ class MysqlToClickhouseConverter:
             mysql_table_structure: TableStructure = table_structure[0]
             ch_table_structure: TableStructure = table_structure[1]
 
-            current_column_type_ch = ch_table_structure.get_field(column_name).field_type
+            current_field = ch_table_structure.get_field(column_name)
+            if not current_field:
+                logger.warning(
+                    f'Column {column_name} not found in table {table_name}, skipping CHANGE COLUMN operation')
+                return
+
+            current_column_type_ch = current_field.field_type
 
             if current_column_type_ch != column_type_ch:
+
                 mysql_table_structure.update_field(
                     TableField(name=column_name, field_type=column_type_mysql),
                 )
@@ -876,7 +913,13 @@ class MysqlToClickhouseConverter:
                 )
 
                 query = f'ALTER TABLE `{db_name}`.`{table_name}` MODIFY COLUMN {column_name} {column_type_ch}'
-                self.db_replicator.clickhouse_api.execute_command(query)
+                try:
+                    self.db_replicator.clickhouse_api.execute_command(query)
+                except Exception as e:
+                    logger.warning(f'Error modifying column {column_name} in CHANGE COLUMN: {e}')
+                    if 'no such column' in str(e).lower():
+                        raise
+                    logger.info(f'Continuing despite MODIFY COLUMN error in CHANGE COLUMN')
 
             if column_name != new_column_name:
                 curr_field_mysql = mysql_table_structure.get_field(column_name)
@@ -886,7 +929,15 @@ class MysqlToClickhouseConverter:
                 curr_field_clickhouse.name = new_column_name
 
                 query = f'ALTER TABLE `{db_name}`.`{table_name}` RENAME COLUMN {column_name} TO {new_column_name}'
-                self.db_replicator.clickhouse_api.execute_command(query)
+                try:
+                    self.db_replicator.clickhouse_api.execute_command(query)
+                except Exception as e:
+                    # Check if column was already renamed
+                    if 'no such column' in str(e).lower() and column_name in str(e):
+                        logger.warning(
+                            f'Column {column_name} might already be renamed to {new_column_name}, continuing')
+                        return
+                    raise
 
     def __convert_alter_table_rename_column(self, db_name, table_name, tokens):
         """
@@ -933,7 +984,15 @@ class MysqlToClickhouseConverter:
         # Execute the RENAME COLUMN command in ClickHouse
         query = f'ALTER TABLE `{db_name}`.`{table_name}` RENAME COLUMN `{old_column_name}` TO `{new_column_name}`'
         if self.db_replicator:
-            self.db_replicator.clickhouse_api.execute_command(query)
+            try:
+                self.db_replicator.clickhouse_api.execute_command(query)
+            except Exception as e:
+                # Check if column was already renamed or doesn't exist
+                if 'no such column' in str(e).lower() and old_column_name in str(e):
+                    logger.warning(
+                        f'Column {old_column_name} might already be renamed to {new_column_name} or does not exist, continuing')
+                    return
+                raise
 
     def _handle_create_table_like(self, create_statement, source_table_name, target_table_name, is_query_api=True):
         """
@@ -957,7 +1016,8 @@ class MysqlToClickhouseConverter:
             # Check if the source table structure is already in our state
             if source_table_name in self.db_replicator.state.tables_structure:
                 # Get the existing structure
-                source_mysql_structure, source_ch_structure = self.db_replicator.state.tables_structure[source_table_name]
+                source_mysql_structure, source_ch_structure = self.db_replicator.state.tables_structure[
+                    source_table_name]
 
                 # Create a new structure with the target table name
                 new_mysql_structure = copy.deepcopy(source_mysql_structure)
@@ -999,7 +1059,8 @@ class MysqlToClickhouseConverter:
                 raise Exception(error_msg, create_statement)
 
         # If we got here, we couldn't determine the structure
-        raise Exception(f"Could not determine structure for source table '{source_table_name}' in LIKE statement", create_statement)
+        raise Exception(f"Could not determine structure for source table '{source_table_name}' in LIKE statement",
+                        create_statement)
 
     def parse_create_table_query(self, mysql_query) -> tuple[TableStructure, TableStructure]:
         # Special handling for CREATE TABLE LIKE statements
@@ -1141,12 +1202,14 @@ class MysqlToClickhouseConverter:
                 field_name = line[1:end_pos]
                 line = line[end_pos + 1:].strip()
                 # Use our new enum parsing utilities
-                field_name, field_type, field_parameters = parse_enum_or_set_field(line, field_name, is_backtick_quoted=True)
+                field_name, field_type, field_parameters = parse_enum_or_set_field(line, field_name,
+                                                                                   is_backtick_quoted=True)
             else:
                 definition = line.split(' ')
                 field_name = strip_sql_name(definition[0])
                 # Use our new enum parsing utilities
-                field_name, field_type, field_parameters = parse_enum_or_set_field(line, field_name, is_backtick_quoted=False)
+                field_name, field_type, field_parameters = parse_enum_or_set_field(line, field_name,
+                                                                                   is_backtick_quoted=False)
 
             # Extract additional data for enum and set types
             additional_data = extract_enum_or_set_values(field_type, from_parser_func=parse_mysql_enum)
@@ -1158,7 +1221,6 @@ class MysqlToClickhouseConverter:
                 additional_data=additional_data,
             ))
             # print(' ---- params:', field_parameters)
-
 
         if not structure.primary_keys:
             for field in structure.fields:
