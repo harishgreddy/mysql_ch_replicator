@@ -9,9 +9,7 @@ from collections import defaultdict
 from .config import ClickhouseSettings
 from .table_structure import TableStructure, TableField
 
-
 logger = getLogger(__name__)
-
 
 CREATE_TABLE_QUERY = '''
 CREATE TABLE {if_not_exists} `{db_name}`.`{table_name}`
@@ -138,7 +136,8 @@ class ClickhouseApi:
     def set_last_used_version(self, table_name, last_used_version):
         self.tables_last_record_version[table_name] = last_used_version
 
-    def create_table(self, structure: TableStructure, additional_indexes: list | None = None, additional_partition_bys: list | None = None):
+    def create_table(self, structure: TableStructure, additional_indexes: list | None = None,
+                     additional_partition_bys: list | None = None):
         if not structure.primary_keys:
             raise Exception(f'missing primary key for {structure.table_name}')
 
@@ -205,8 +204,8 @@ class ClickhouseApi:
                 if table_structure is not None:
                     field: TableField = table_structure.fields[i]
                     is_datetime = (
-                        ('DateTime' in field.field_type) or
-                        ('Date32' in field.field_type)
+                            ('DateTime' in field.field_type) or
+                            ('Date32' in field.field_type)
                     )
                     if is_datetime and 'Nullable' not in field.field_type:
                         try:
@@ -248,12 +247,37 @@ class ClickhouseApi:
 
     def erase(self, table_name, field_name, field_values):
         field_name = ','.join(field_name)
-        field_values = ', '.join(f'({v})' for v in field_values)
+
+        # Properly format field values - quote strings, handle tuples
+        formatted_values = []
+        for v in field_values:
+            if isinstance(v, (list, tuple)):
+                # Handle tuples/lists of values (for composite keys)
+                formatted_parts = []
+                for part in v:
+                    if isinstance(part, str):
+                        formatted_parts.append(f"'{part}'")
+                    elif part is None:
+                        formatted_parts.append('NULL')
+                    else:
+                        formatted_parts.append(str(part))
+                formatted_values.append(f"({', '.join(formatted_parts)})")
+            else:
+                # Handle single values
+                if isinstance(v, str):
+                    formatted_values.append(f"('{v}')")
+                elif v is None:
+                    formatted_values.append('(NULL)')
+                else:
+                    formatted_values.append(f"({v})")
+
+        field_values_str = ', '.join(formatted_values)
+
         query = DELETE_QUERY.format(**{
             'db_name': self.database,
             'table_name': table_name,
             'field_name': field_name,
-            'field_values': field_values,
+            'field_values': field_values_str,
         })
         t1 = time.time()
         self.execute_command(query)
@@ -263,7 +287,7 @@ class ClickhouseApi:
             table_name=table_name,
             duration=duration,
             is_insert=False,
-            records=len(field_values),
+            records=len(formatted_values),
         )
 
     def drop_database(self, db_name):
@@ -302,10 +326,10 @@ class ClickhouseApi:
     def get_max_record_version(self, table_name):
         """
         Query the maximum _version value for a given table directly from ClickHouse.
-        
+
         Args:
             table_name: The name of the table to query
-            
+
         Returns:
             The maximum _version value as an integer, or None if the table doesn't exist
             or has no records
