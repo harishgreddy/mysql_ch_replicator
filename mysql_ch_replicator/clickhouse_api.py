@@ -27,7 +27,6 @@ DELETE_QUERY = '''
 DELETE FROM `{db_name}`.`{table_name}` WHERE ({field_name}) IN ({field_values})
 '''
 
-
 @dataclass
 class SingleStats:
     duration: float = 0.0
@@ -246,30 +245,38 @@ class ClickhouseApi:
         self.set_last_used_version(table_name, current_version)
 
     def erase(self, table_name, field_name, field_values):
+        def format_value(val):
+            """Format a single value for SQL query"""
+            # Handle bytes - decode to string
+            if isinstance(val, bytes):
+                val = val.decode('utf-8', errors='replace')
+
+            # Handle strings - escape single quotes and wrap in quotes
+            if isinstance(val, str):
+                # Escape single quotes by doubling them
+                escaped = val.replace("'", "''")
+                return f"'{escaped}'"
+
+            # Handle None
+            elif val is None:
+                return 'NULL'
+
+            # Handle other types (numbers, booleans, etc.)
+            else:
+                return str(val)
+
         field_name = ','.join(field_name)
 
-        # Properly format field values - quote strings, handle tuples
+        # Format field values
         formatted_values = []
         for v in field_values:
             if isinstance(v, (list, tuple)):
                 # Handle tuples/lists of values (for composite keys)
-                formatted_parts = []
-                for part in v:
-                    if isinstance(part, str):
-                        formatted_parts.append(f"'{part}'")
-                    elif part is None:
-                        formatted_parts.append('NULL')
-                    else:
-                        formatted_parts.append(str(part))
+                formatted_parts = [format_value(part) for part in v]
                 formatted_values.append(f"({', '.join(formatted_parts)})")
             else:
                 # Handle single values
-                if isinstance(v, str):
-                    formatted_values.append(f"('{v}')")
-                elif v is None:
-                    formatted_values.append('(NULL)')
-                else:
-                    formatted_values.append(f"({v})")
+                formatted_values.append(f"({format_value(v)})")
 
         field_values_str = ', '.join(formatted_values)
 

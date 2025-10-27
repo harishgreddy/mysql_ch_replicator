@@ -111,14 +111,17 @@ class DbReplicatorRealtime:
         self.replicator.state.save()
 
     def _get_record_id(self, ch_table_structure, record: list):
+        """
+        Extract the primary key values from a record.
+        Returns a tuple of raw values (not pre-quoted) that can be used both:
+        1. As a dictionary key for tracking records
+        2. Passed to erase() which will handle proper SQL quoting
+        """
         result = []
         for idx in ch_table_structure.primary_key_ids:
-            field_type = ch_table_structure.fields[idx].field_type
-            if field_type == 'String':
-                result.append(f"'{record[idx]}'")
-            else:
-                result.append(record[idx])
-        return ','.join(map(str, result))
+            result.append(record[idx])
+        # Return as tuple for composite keys, or single value for single keys
+        return tuple(result) if len(result) > 1 else result[0]
 
     def handle_insert_event(self, event: LogEvent):
         if self.replicator.config.debug_log_level:
