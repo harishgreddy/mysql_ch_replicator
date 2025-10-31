@@ -130,6 +130,15 @@ class DbReplicatorRealtime:
                 f'table: {event.table_name}, '
                 f'records: {event.records}',
             )
+
+        # Check if table structure exists before processing
+        if event.table_name not in self.replicator.state.tables_structure:
+            logger.warning(
+                f'Skipping insert event for table {event.table_name} - table structure not found. '
+                f'Table may have been created after initial replication or filtered out.'
+            )
+            return
+
         self.replicator.stats.insert_events_count += 1
         self.replicator.stats.insert_records_count += len(event.records)
 
@@ -161,6 +170,14 @@ class DbReplicatorRealtime:
                     f'table: {event.table_name}, '
                     f'records: {len(event.records)}',
                 )
+            return
+
+        # Check if table structure exists before processing
+        if event.table_name not in self.replicator.state.tables_structure:
+            logger.warning(
+                f'Skipping erase event for table {event.table_name} - table structure not found. '
+                f'Table may have been created after initial replication or filtered out.'
+            )
             return
 
         self.replicator.stats.erase_events_count += 1
