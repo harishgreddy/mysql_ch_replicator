@@ -395,6 +395,8 @@ class MysqlToClickhouseConverter:
             return 'String'
         if mysql_type == 'year':
             return 'UInt16'  # MySQL YEAR type can store years from 1901 to 2155, UInt16 is sufficient
+        if mysql_type == 'boolean' or mysql_type == 'bool':
+            return 'UInt8'  # MySQL BOOLEAN is an alias for TINYINT(1), stores 0 or 1
         raise Exception(f'unknown mysql type "{mysql_type}"')
 
     def convert_field_type(self, mysql_type, mysql_parameters):
