@@ -1,11 +1,10 @@
 import struct
 import json
 import uuid
-from typing import Optional
 
 import sqlparse
 import re
-from pyparsing import Suppress, CaselessKeyword, Word, alphas, alphanums, delimitedList
+from pyparsing import Suppress, CaselessKeyword, Word, alphas, alphanums, delimitedList, Optional
 import copy
 
 from .binlog_replicator import logger
