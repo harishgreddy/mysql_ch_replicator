@@ -1,6 +1,8 @@
 import struct
 import json
 import uuid
+from typing import Optional
+
 import sqlparse
 import re
 from pyparsing import Suppress, CaselessKeyword, Word, alphas, alphanums, delimitedList
@@ -1172,6 +1174,30 @@ class MysqlToClickhouseConverter:
             if line.lower().startswith('key'):
                 continue
             if line.lower().startswith('constraint'):
+                # Check if this constraint defines a PRIMARY KEY
+                if 'primary key' in line.lower():
+                    # Extract column names from CONSTRAINT ... PRIMARY KEY (...) syntax
+                    # Define identifier to match column names, handling backticks and unquoted names
+                    identifier = (Suppress('`') + Word(alphas + alphanums + '_') + Suppress('`')) | Word(
+                        alphas + alphanums + '_')
+
+                    # Build the parsing pattern for CONSTRAINT syntax
+                    # Pattern: CONSTRAINT [constraint_name] PRIMARY KEY (col1, col2, ...)
+                    pattern = (CaselessKeyword('CONSTRAINT') +
+                               Optional(identifier)('constraint_name') +
+                               CaselessKeyword('PRIMARY') +
+                               CaselessKeyword('KEY') +
+                               Suppress('(') +
+                               delimitedList(identifier)('column_names') +
+                               Suppress(')'))
+
+                    # Parse the line
+                    result = pattern.parseString(line)
+
+                    # Extract and process the primary key column names
+                    primary_keys = [strip_sql_name(name) for name in result['column_names']]
+
+                    structure.primary_keys = primary_keys
                 continue
             if line.lower().startswith('fulltext'):
                 continue
