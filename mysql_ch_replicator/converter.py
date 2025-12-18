@@ -597,16 +597,21 @@ class MysqlToClickhouseConverter:
         mysql_query = self.__basic_validate_query(mysql_query)
 
         tokens = mysql_query.split()
-        if tokens[0].lower() != 'alter':
-            raise Exception('wrong query')
-
-        # Skip ALTER DATABASE queries - they're MySQL-specific and not applicable to ClickHouse
-        if tokens[1].lower() == 'database':
-            logger.info(f'Skipping ALTER DATABASE query (not applicable to ClickHouse): {mysql_query}')
+        if not tokens or tokens[0].lower() != 'alter':
+            logger.warning(f'Skipping non-ALTER query in convert_alter_query: {mysql_query[:100]}')
             return
 
-        if tokens[1].lower() != 'table':
-            raise Exception('wrong query')
+        if len(tokens) < 2:
+            logger.warning(f'Skipping incomplete ALTER query: {mysql_query}')
+            return
+
+        alter_type = tokens[1].lower()
+
+        # Only handle ALTER TABLE - skip all other ALTER types
+        # (ALTER DATABASE, ALTER INDEX, ALTER EVENT, ALTER VIEW, ALTER PROCEDURE, etc.)
+        if alter_type != 'table':
+            logger.info(f'Skipping ALTER {alter_type.upper()} query (not applicable to ClickHouse): {mysql_query[:100]}')
+            return
 
         db_name, table_name, matches_config = self.get_db_and_table_name(tokens[2], db_name)
 
