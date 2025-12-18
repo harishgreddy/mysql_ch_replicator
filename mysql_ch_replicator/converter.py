@@ -559,8 +559,8 @@ class MysqlToClickhouseConverter:
         mysql_query = mysql_query.strip()
         if mysql_query.endswith(';'):
             mysql_query = mysql_query[:-1]
-        if mysql_query.find(';') != -1:
-            raise Exception('multi-query statement not supported')
+        # Note: Multi-statement splitting is now handled upstream in db_replicator_realtime.py
+        # using sqlparse.split() which correctly handles semicolons inside string literals
         return mysql_query
 
     def get_db_and_table_name(self, token, db_name):
