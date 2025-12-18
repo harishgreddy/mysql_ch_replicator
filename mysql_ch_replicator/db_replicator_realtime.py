@@ -4,6 +4,8 @@ import time
 from logging import getLogger
 from collections import defaultdict
 
+import sqlparse
+
 from .binlog_replicator import LogEvent, EventType
 from .table_structure import TableStructure
 from .utils import GracefulKiller, touch_all_files, format_floats
@@ -201,20 +203,32 @@ class DbReplicatorRealtime:
         if self.replicator.config.debug_log_level:
             logger.debug(f'processing query event: {event.transaction_id}, query: {event.records}')
         query = strip_sql_comments(event.records)
-        if query.lower().startswith('alter'):
+
+        # Split multi-statement queries and process each one individually
+        statements = sqlparse.split(query)
+        for stmt in statements:
+            stmt = stmt.strip()
+            if not stmt:
+                continue
+            self._process_single_query(stmt, event.db_name)
+
+    def _process_single_query(self, query, db_name):
+        """Process a single SQL query statement."""
+        query_lower = query.lower()
+        if query_lower.startswith('alter'):
             self.upload_records()
-            self.handle_alter_query(query, event.db_name)
-        if query.lower().startswith('create table'):
-            self.handle_create_table_query(query, event.db_name)
-        if query.lower().startswith('drop table'):
+            self.handle_alter_query(query, db_name)
+        elif query_lower.startswith('create table'):
+            self.handle_create_table_query(query, db_name)
+        elif query_lower.startswith('drop table'):
             self.upload_records()
-            self.handle_drop_table_query(query, event.db_name)
-        if query.lower().startswith('rename table'):
+            self.handle_drop_table_query(query, db_name)
+        elif query_lower.startswith('rename table'):
             self.upload_records()
-            self.handle_rename_table_query(query, event.db_name)
-        if query.lower().startswith('truncate'):
+            self.handle_rename_table_query(query, db_name)
+        elif query_lower.startswith('truncate'):
             self.upload_records()
-            self.handle_truncate_query(query, event.db_name)
+            self.handle_truncate_query(query, db_name)
 
     def handle_alter_query(self, query, db_name):
         self.replicator.converter.convert_alter_query(query, db_name)
