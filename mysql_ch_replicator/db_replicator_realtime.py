@@ -204,12 +204,16 @@ class DbReplicatorRealtime:
             logger.debug(f'processing query event: {event.transaction_id}, query: {event.records}')
         query = strip_sql_comments(event.records)
 
+        logger.info(f'[QUERY_EVENT_RAW] db_name={event.db_name}, full_query={repr(query)}')
+
         # Split multi-statement queries and process each one individually
         statements = sqlparse.split(query)
-        for stmt in statements:
+        logger.info(f'[QUERY_EVENT_SPLIT] {len(statements)} statement(s)')
+        for idx, stmt in enumerate(statements):
             stmt = stmt.strip()
             if not stmt:
                 continue
+            logger.info(f'[QUERY_EVENT_STMT {idx}] {repr(stmt)}')
             self._process_single_query(stmt, event.db_name)
 
     def _process_single_query(self, query, db_name):
