@@ -1283,11 +1283,14 @@ class MysqlToClickhouseConverter:
         if not structure.primary_keys:
             # Try to fetch primary key from MySQL (e.g. Liquibase sends CREATE TABLE
             # and ALTER TABLE ADD PRIMARY KEY as separate binlog events)
+            logger.info(f'No primary key found in CREATE statement for table {structure.table_name}, '
+                        f'attempting to fetch from MySQL. db_replicator={self.db_replicator is not None}')
             if (self.db_replicator is not None
                     and hasattr(self.db_replicator, 'mysql_api')
                     and self.db_replicator.mysql_api is not None):
                 try:
                     actual_create = self.db_replicator.mysql_api.get_table_create_statement(structure.table_name)
+                    logger.info(f'MySQL SHOW CREATE TABLE for {structure.table_name}: {repr(actual_create)}')
                     actual_structure = self.parse_mysql_table_structure(actual_create)
                     if actual_structure.primary_keys:
                         structure.primary_keys = actual_structure.primary_keys
@@ -1298,6 +1301,15 @@ class MysqlToClickhouseConverter:
                     logger.warning(
                         f'Could not fetch primary key from MySQL for table '
                         f'{structure.table_name}: {e}')
+
+        if not structure.primary_keys:
+            # Last resort: use all NOT NULL columns as composite key (common for join/mapping tables)
+            not_null_fields = [f.name for f in structure.fields if 'not null' in f.parameters.lower()]
+            if not_null_fields:
+                structure.primary_keys = not_null_fields
+                logger.warning(
+                    f'No primary key for table {structure.table_name}, '
+                    f'using NOT NULL columns as primary key: {not_null_fields}')
 
         if not structure.primary_keys:
             raise Exception(f'No primary key for table {structure.table_name}, {create_statement}')
