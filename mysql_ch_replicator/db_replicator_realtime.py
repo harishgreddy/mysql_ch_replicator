@@ -1,5 +1,6 @@
 import json
 import os.path
+import re
 import time
 from logging import getLogger
 from collections import defaultdict
@@ -205,12 +206,72 @@ class DbReplicatorRealtime:
         query = strip_sql_comments(event.records)
 
         # Split multi-statement queries and process each one individually
-        statements = sqlparse.split(query)
+        statements = [s.strip() for s in sqlparse.split(query) if s.strip()]
+        statements = self._merge_create_table_with_primary_key(statements)
         for stmt in statements:
-            stmt = stmt.strip()
-            if not stmt:
-                continue
             self._process_single_query(stmt, event.db_name)
+
+    @staticmethod
+    def _merge_create_table_with_primary_key(statements):
+        """Merge ALTER TABLE ADD PRIMARY KEY into preceding CREATE TABLE.
+
+        Liquibase often generates CREATE TABLE without a PRIMARY KEY followed by
+        a separate ALTER TABLE ... ADD PRIMARY KEY statement. ClickHouse requires
+        an ordering key, so we merge them before processing.
+        """
+        if len(statements) < 2:
+            return statements
+
+        pk_pattern = re.compile(
+            r'ALTER\s+TABLE\s+\S+\s+ADD\s+(?:CONSTRAINT\s+\S+\s+)?PRIMARY\s+KEY\s*(\([^)]+\))',
+            re.IGNORECASE,
+        )
+
+        # Map table name -> (index, pk_columns_clause) for ALTER ADD PRIMARY KEY stmts
+        pk_stmts = {}
+        for i, stmt in enumerate(statements):
+            m = pk_pattern.match(stmt)
+            if m:
+                # Extract table name from the ALTER TABLE statement
+                table_match = re.match(r'ALTER\s+TABLE\s+(\S+)', stmt, re.IGNORECASE)
+                if table_match:
+                    table_name = table_match.group(1).strip('`"').split('.')[-1].strip('`"')
+                    pk_stmts[table_name] = (i, m.group(1))
+
+        if not pk_stmts:
+            return statements
+
+        create_pattern = re.compile(
+            r'^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\S+)\s*\(',
+            re.IGNORECASE,
+        )
+
+        result = list(statements)
+        consumed_indices = set()
+        for i, stmt in enumerate(statements):
+            cm = create_pattern.match(stmt)
+            if not cm:
+                continue
+            table_name = cm.group(1).strip('`"').split('.')[-1].strip('`"')
+            if table_name not in pk_stmts:
+                continue
+
+            pk_idx, pk_clause = pk_stmts[table_name]
+
+            # Insert PRIMARY KEY clause into the CREATE TABLE before the closing paren
+            # Find the last ')' that closes the column definitions
+            last_paren = stmt.rfind(')')
+            if last_paren == -1:
+                continue
+
+            new_stmt = stmt[:last_paren].rstrip().rstrip(',') + ', PRIMARY KEY ' + pk_clause + stmt[last_paren:]
+            result[i] = new_stmt
+            consumed_indices.add(pk_idx)
+
+        if consumed_indices:
+            result = [s for idx, s in enumerate(result) if idx not in consumed_indices]
+
+        return result
 
     def _process_single_query(self, query, db_name):
         """Process a single SQL query statement."""
