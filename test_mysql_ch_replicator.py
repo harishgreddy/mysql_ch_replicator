@@ -2674,41 +2674,30 @@ def test_parse_create_table_query_ignores_table_level_index_clauses(index_clause
     assert mysql_structure.primary_keys == ['id']
     assert [field.name for field in ch_structure.fields] == ['id', 'name']
 
-def test_merge_create_table_with_primary_key():
-    """Test that CREATE TABLE + ALTER TABLE ADD PRIMARY KEY are merged."""
-    from mysql_ch_replicator.db_replicator_realtime import DbReplicatorRealtime
+def test_no_primary_key_fetches_from_mysql():
+    """Test that CREATE TABLE without PK fetches PK from MySQL via db_replicator."""
+    from unittest.mock import MagicMock
 
-    statements = [
-        'CREATE TABLE livine_demo.company_jurisdiction_mappings (profile_id BIGINT NOT NULL, jurisdiction_code VARCHAR(10) NOT NULL)',
-        'ALTER TABLE livine_demo.company_jurisdiction_mappings ADD PRIMARY KEY (profile_id, jurisdiction_code)',
-    ]
-    merged = DbReplicatorRealtime._merge_create_table_with_primary_key(statements)
-    assert len(merged) == 1
-    assert 'PRIMARY KEY (profile_id, jurisdiction_code)' in merged[0]
-    assert merged[0].startswith('CREATE TABLE')
+    mock_replicator = MagicMock()
+    mock_replicator.config.types_mapping = {}
+    mock_replicator.mysql_api.get_table_create_statement.return_value = (
+        'CREATE TABLE `company_jurisdiction_mappings` ('
+        '`profile_id` BIGINT NOT NULL, '
+        '`jurisdiction_code` VARCHAR(10) NOT NULL, '
+        'PRIMARY KEY (`profile_id`, `jurisdiction_code`)'
+        ')'
+    )
 
-    # Verify the merged statement can be parsed
-    converter = MysqlToClickhouseConverter()
-    mysql_structure, ch_structure = converter.parse_create_table_query(merged[0])
+    converter = MysqlToClickhouseConverter(db_replicator=mock_replicator)
+    mysql_structure, ch_structure = converter.parse_create_table_query(
+        'CREATE TABLE livine_demo.company_jurisdiction_mappings '
+        '(profile_id BIGINT NOT NULL, jurisdiction_code VARCHAR(10) NOT NULL)'
+    )
+
     assert mysql_structure.table_name == 'company_jurisdiction_mappings'
     assert mysql_structure.primary_keys == ['profile_id', 'jurisdiction_code']
-
-
-def test_merge_create_table_with_constraint_primary_key():
-    """Test merge with CONSTRAINT ... PRIMARY KEY syntax."""
-    from mysql_ch_replicator.db_replicator_realtime import DbReplicatorRealtime
-
-    statements = [
-        'CREATE TABLE `my_table` (`id` BIGINT NOT NULL, `name` VARCHAR(255) NOT NULL)',
-        'ALTER TABLE `my_table` ADD CONSTRAINT `pk_my_table` PRIMARY KEY (`id`)',
-    ]
-    merged = DbReplicatorRealtime._merge_create_table_with_primary_key(statements)
-    assert len(merged) == 1
-    assert 'PRIMARY KEY (`id`)' in merged[0]
-
-    converter = MysqlToClickhouseConverter()
-    mysql_structure, ch_structure = converter.parse_create_table_query(merged[0])
-    assert mysql_structure.primary_keys == ['id']
+    mock_replicator.mysql_api.get_table_create_statement.assert_called_once_with(
+        'company_jurisdiction_mappings')
 
 
 def test_truncate_operation_bug_issue_155():

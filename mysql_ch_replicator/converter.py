@@ -1281,6 +1281,25 @@ class MysqlToClickhouseConverter:
                 structure.primary_keys = ['id']
 
         if not structure.primary_keys:
+            # Try to fetch primary key from MySQL (e.g. Liquibase sends CREATE TABLE
+            # and ALTER TABLE ADD PRIMARY KEY as separate binlog events)
+            if (self.db_replicator is not None
+                    and hasattr(self.db_replicator, 'mysql_api')
+                    and self.db_replicator.mysql_api is not None):
+                try:
+                    actual_create = self.db_replicator.mysql_api.get_table_create_statement(structure.table_name)
+                    actual_structure = self.parse_mysql_table_structure(actual_create)
+                    if actual_structure.primary_keys:
+                        structure.primary_keys = actual_structure.primary_keys
+                        logger.info(
+                            f'Fetched primary key {structure.primary_keys} for table '
+                            f'{structure.table_name} from MySQL')
+                except Exception as e:
+                    logger.warning(
+                        f'Could not fetch primary key from MySQL for table '
+                        f'{structure.table_name}: {e}')
+
+        if not structure.primary_keys:
             raise Exception(f'No primary key for table {structure.table_name}, {create_statement}')
 
         structure.preprocess()
