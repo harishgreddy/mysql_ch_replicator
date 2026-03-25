@@ -1283,14 +1283,11 @@ class MysqlToClickhouseConverter:
         if not structure.primary_keys:
             # Try to fetch primary key from MySQL (e.g. Liquibase sends CREATE TABLE
             # and ALTER TABLE ADD PRIMARY KEY as separate binlog events)
-            logger.info(f'No primary key found in CREATE statement for table {structure.table_name}, '
-                        f'attempting to fetch from MySQL. db_replicator={self.db_replicator is not None}')
             if (self.db_replicator is not None
                     and hasattr(self.db_replicator, 'mysql_api')
                     and self.db_replicator.mysql_api is not None):
                 try:
                     actual_create = self.db_replicator.mysql_api.get_table_create_statement(structure.table_name)
-                    logger.info(f'MySQL SHOW CREATE TABLE for {structure.table_name}: {repr(actual_create)}')
                     actual_structure = self.parse_mysql_table_structure(actual_create)
                     if actual_structure.primary_keys:
                         structure.primary_keys = actual_structure.primary_keys
