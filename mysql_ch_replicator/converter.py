@@ -4,7 +4,6 @@ import uuid
 
 import sqlparse
 import re
-from pyparsing import Suppress, CaselessKeyword, Word, alphas, alphanums, delimitedList, Optional
 import copy
 
 from .binlog_replicator import logger
@@ -247,6 +246,68 @@ class MysqlToClickhouseConverter:
         self.types_mapping = {}
         if self.db_replicator is not None:
             self.types_mapping = db_replicator.config.types_mapping
+
+    @staticmethod
+    def _extract_parenthesized_expression(line, start_pos):
+        if start_pos < 0 or start_pos >= len(line) or line[start_pos] != '(':
+            return None
+
+        level = 0
+        for pos in range(start_pos, len(line)):
+            char = line[pos]
+            if char == '(':
+                level += 1
+            elif char == ')':
+                level -= 1
+                if level == 0:
+                    return line[start_pos + 1:pos]
+        return None
+
+    def _parse_primary_key_columns(self, line):
+        line_lower = line.lower()
+        primary_key_pos = line_lower.find('primary key')
+        if primary_key_pos == -1:
+            return None
+
+        open_paren_pos = line.find('(', primary_key_pos)
+        if open_paren_pos == -1:
+            return None
+
+        columns_definition = self._extract_parenthesized_expression(line, open_paren_pos)
+        if columns_definition is None:
+            return None
+
+        primary_keys = []
+        for column_definition in split_high_level(columns_definition, ','):
+            column_definition = column_definition.strip()
+            if not column_definition:
+                continue
+
+            match = re.match(r'`([^`]+)`|([A-Za-z_][A-Za-z0-9_]*)', column_definition)
+            if not match:
+                continue
+
+            column_name = match.group(1) or match.group(2)
+            primary_keys.append(strip_sql_name(column_name))
+
+        return primary_keys or None
+
+    @staticmethod
+    def _is_table_level_definition(line):
+        return re.match(
+            r'^(?:'
+            r'constraint\b|'
+            r'primary\s+key\b|'
+            r'foreign\s+key\b|'
+            r'unique(?:\s+(?:key|index))?\b|'
+            r'(?:fulltext|spatial)(?:\s+(?:key|index))?\b|'
+            r'index\b|'
+            r'key\b|'
+            r'check\b'
+            r')',
+            line,
+            re.IGNORECASE,
+        ) is not None
 
     def convert_type(self, mysql_type, parameters):
         is_unsigned = 'unsigned' in parameters.lower()
@@ -1166,67 +1227,23 @@ class MysqlToClickhouseConverter:
 
         prev_line = ''
         for line in inner_tokens:
-            line = prev_line + line
+            line = (prev_line + line).strip()
+            if not line:
+                continue
             q_count = line.count('`')
             if q_count % 2 == 1:
                 prev_line = line
                 continue
             prev_line = ''
 
-            if line.lower().startswith('unique key'):
-                continue
-            if line.lower().startswith('key'):
-                continue
-            if line.lower().startswith('constraint'):
-                # Check if this constraint defines a PRIMARY KEY
-                if 'primary key' in line.lower():
-                    # Extract column names from CONSTRAINT ... PRIMARY KEY (...) syntax
-                    # Define identifier to match column names, handling backticks and unquoted names
-                    identifier = (Suppress('`') + Word(alphas + alphanums + '_') + Suppress('`')) | Word(
-                        alphas + alphanums + '_')
-
-                    # Build the parsing pattern for CONSTRAINT syntax
-                    # Pattern: CONSTRAINT [constraint_name] PRIMARY KEY (col1, col2, ...)
-                    pattern = (CaselessKeyword('CONSTRAINT') +
-                               Optional(identifier)('constraint_name') +
-                               CaselessKeyword('PRIMARY') +
-                               CaselessKeyword('KEY') +
-                               Suppress('(') +
-                               delimitedList(identifier)('column_names') +
-                               Suppress(')'))
-
-                    # Parse the line
-                    result = pattern.parseString(line)
-
-                    # Extract and process the primary key column names
-                    primary_keys = [strip_sql_name(name) for name in result['column_names']]
-
-                    structure.primary_keys = primary_keys
-                continue
-            if line.lower().startswith('fulltext'):
-                continue
-            if line.lower().startswith('spatial'):
-                continue
-            if line.lower().startswith('primary key'):
-                # Define identifier to match column names, handling backticks and unquoted names
-                identifier = (Suppress('`') + Word(alphas + alphanums + '_') + Suppress('`')) | Word(
-                    alphas + alphanums + '_')
-
-                # Build the parsing pattern
-                pattern = CaselessKeyword('PRIMARY') + CaselessKeyword('KEY') + Suppress('(') + delimitedList(
-                    identifier)('column_names') + Suppress(')')
-
-                # Parse the line
-                result = pattern.parseString(line)
-
-                # Extract and process the primary key column names
-                primary_keys = [strip_sql_name(name) for name in result['column_names']]
-
+            primary_keys = self._parse_primary_key_columns(line)
+            if primary_keys:
                 structure.primary_keys = primary_keys
-
                 continue
 
-            line = line.strip()
+            if self._is_table_level_definition(line):
+                continue
+
             # print(" === processing line", line)
 
             if line.startswith('`'):

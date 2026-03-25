@@ -2651,6 +2651,29 @@ def test_issue_160_unknown_mysql_type_bug():
     assert len(mysql_structure.fields) == 17  # All columns should be parsed
     assert mysql_structure.primary_keys == ['id', 'col_e']
 
+
+@pytest.mark.parametrize('index_clause', [
+    'INDEX (name)',
+    'INDEX idx_supplier_name (name)',
+])
+def test_parse_create_table_query_ignores_table_level_index_clauses(index_clause):
+    create_table_query = f"""CREATE TABLE supplier (
+        id BIGINT NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        {index_clause},
+        PRIMARY KEY (id)
+    );"""
+
+    converter = MysqlToClickhouseConverter()
+
+    mysql_structure, ch_structure = converter.parse_create_table_query(create_table_query)
+
+    assert mysql_structure.table_name == 'supplier'
+    assert [field.name for field in mysql_structure.fields] == ['id', 'name']
+    assert [field.field_type for field in mysql_structure.fields] == ['BIGINT', 'VARCHAR(255)']
+    assert mysql_structure.primary_keys == ['id']
+    assert [field.name for field in ch_structure.fields] == ['id', 'name']
+
 def test_truncate_operation_bug_issue_155():
     """
     Test to reproduce the bug from issue #155.
