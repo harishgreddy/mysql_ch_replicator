@@ -1,3 +1,4 @@
+import copy
 import datetime
 import os
 import shutil
@@ -18,6 +19,7 @@ from mysql_ch_replicator import clickhouse_api
 from mysql_ch_replicator.binlog_replicator import State as BinlogState, FileReader, EventType, BinlogReplicator
 from mysql_ch_replicator.db_replicator import State as DbReplicatorState, DbReplicator, DbReplicatorInitial
 from mysql_ch_replicator.converter import MysqlToClickhouseConverter
+from mysql_ch_replicator.table_structure import TableStructure, TableField
 
 from mysql_ch_replicator.runner import ProcessRunner
 
@@ -1647,6 +1649,136 @@ def test_alter_tokens_split():
         print("Match?     ", result == expected)
         print("-" * 60)
         assert result == expected
+
+
+class FakeClickhouseApi:
+    def __init__(self):
+        self.commands = []
+        self.tables_last_record_version = {}
+
+    def execute_command(self, command):
+        self.commands.append(command)
+
+
+class FakeState:
+    def __init__(self):
+        self.tables_structure = {}
+
+
+class FakeDbReplicator:
+    """Minimal stand-in for DbReplicator, enough for converter DDL unit tests."""
+
+    def __init__(self, cfg, database, target_database=None):
+        self.config = cfg
+        self.database = database
+        self.target_database = target_database or database
+        self.clickhouse_api = FakeClickhouseApi()
+        self.state = FakeState()
+
+
+def make_converter_with_table(table_name, fields=None):
+    cfg = config.Settings()
+    cfg.load(CONFIG_FILE)
+    db_replicator = FakeDbReplicator(cfg, TEST_DB_NAME)
+    fields = fields or []
+    # Deep copy so the MySQL and ClickHouse structures own separate field objects,
+    # exactly as they do in a real replicator.
+    db_replicator.state.tables_structure[table_name] = (
+        TableStructure(fields=copy.deepcopy(fields), table_name=table_name),
+        TableStructure(fields=copy.deepcopy(fields), table_name=table_name),
+    )
+    return MysqlToClickhouseConverter(db_replicator), db_replicator
+
+
+def test_alter_table_rename_table():
+    """
+    `ALTER TABLE t RENAME [TO|AS] new_t` renames the table, not a column.
+    Liquibase's <renameTable> emits the no-keyword form against MySQL.
+    """
+    queries = [
+        # Liquibase MySQL form: no TO/AS, fully qualified destination.
+        f'ALTER TABLE `{TEST_DB_NAME}`.`{TEST_TABLE_NAME}` RENAME `{TEST_DB_NAME}`.`{TEST_TABLE_NAME_2}`',
+        f'ALTER TABLE `{TEST_DB_NAME}`.`{TEST_TABLE_NAME}` RENAME TO `{TEST_DB_NAME}`.`{TEST_TABLE_NAME_2}`',
+        f'ALTER TABLE `{TEST_DB_NAME}`.`{TEST_TABLE_NAME}` RENAME AS `{TEST_TABLE_NAME_2}`',
+        f'ALTER TABLE {TEST_TABLE_NAME} RENAME {TEST_TABLE_NAME_2}',
+        # Exactly what Liquibase emits: unquoted and db-qualified on both sides.
+        f'ALTER TABLE {TEST_DB_NAME}.{TEST_TABLE_NAME} RENAME {TEST_DB_NAME}.{TEST_TABLE_NAME_2}',
+    ]
+
+    for query in queries:
+        converter, db_replicator = make_converter_with_table(TEST_TABLE_NAME)
+        db_replicator.clickhouse_api.tables_last_record_version[TEST_TABLE_NAME] = 42
+        converter.convert_alter_query(query, TEST_DB_NAME)
+
+        assert TEST_TABLE_NAME not in db_replicator.state.tables_structure, query
+        assert TEST_TABLE_NAME_2 in db_replicator.state.tables_structure, query
+        for structure in db_replicator.state.tables_structure[TEST_TABLE_NAME_2]:
+            assert structure.table_name == TEST_TABLE_NAME_2, query
+        # The row version counter must follow the table, not restart at zero.
+        assert db_replicator.clickhouse_api.tables_last_record_version == {
+            TEST_TABLE_NAME_2: 42
+        }, query
+        assert db_replicator.clickhouse_api.commands == [
+            f'RENAME TABLE `{TEST_DB_NAME}`.`{TEST_TABLE_NAME}` '
+            f'TO `{TEST_DB_NAME}`.`{TEST_TABLE_NAME_2}`'
+        ], query
+
+
+def test_alter_table_rename_table_with_database_mapping():
+    """The destination table is resolved against the source db, then mapped to the target db."""
+    cfg = config.Settings()
+    cfg.load(CONFIG_FILE)
+    db_replicator = FakeDbReplicator(cfg, TEST_DB_NAME_2, TEST_DB_NAME_2_DESTINATION)
+    db_replicator.state.tables_structure[TEST_TABLE_NAME] = (
+        TableStructure(table_name=TEST_TABLE_NAME),
+        TableStructure(table_name=TEST_TABLE_NAME),
+    )
+    converter = MysqlToClickhouseConverter(db_replicator)
+
+    converter.convert_alter_query(
+        f'ALTER TABLE {TEST_DB_NAME_2}.{TEST_TABLE_NAME} RENAME {TEST_DB_NAME_2}.{TEST_TABLE_NAME_2}',
+        TEST_DB_NAME_2,
+    )
+
+    assert list(db_replicator.state.tables_structure) == [TEST_TABLE_NAME_2]
+    assert db_replicator.clickhouse_api.commands == [
+        f'RENAME TABLE `{TEST_DB_NAME_2_DESTINATION}`.`{TEST_TABLE_NAME}` '
+        f'TO `{TEST_DB_NAME_2_DESTINATION}`.`{TEST_TABLE_NAME_2}`'
+    ]
+
+
+def test_alter_table_rename_column_still_works():
+    """RENAME COLUMN must keep renaming columns, not tables."""
+    fields = [TableField(name='old_name', field_type='varchar(255)')]
+    converter, db_replicator = make_converter_with_table(TEST_TABLE_NAME, fields)
+
+    converter.convert_alter_query(
+        f'ALTER TABLE `{TEST_DB_NAME}`.`{TEST_TABLE_NAME}` RENAME COLUMN old_name TO new_name',
+        TEST_DB_NAME,
+    )
+
+    assert TEST_TABLE_NAME in db_replicator.state.tables_structure
+    for structure in db_replicator.state.tables_structure[TEST_TABLE_NAME]:
+        assert [f.name for f in structure.fields] == ['new_name']
+    assert db_replicator.clickhouse_api.commands == [
+        f'ALTER TABLE `{TEST_DB_NAME}`.`{TEST_TABLE_NAME}` '
+        f'RENAME COLUMN `old_name` TO `new_name`'
+    ]
+
+
+def test_alter_table_rename_index_skipped():
+    """RENAME INDEX/KEY has no ClickHouse equivalent and must be ignored, not misparsed."""
+    for keyword in ('INDEX', 'KEY'):
+        converter, db_replicator = make_converter_with_table(TEST_TABLE_NAME)
+
+        converter.convert_alter_query(
+            f'ALTER TABLE `{TEST_DB_NAME}`.`{TEST_TABLE_NAME}` '
+            f'RENAME {keyword} old_idx TO new_idx',
+            TEST_DB_NAME,
+        )
+
+        assert TEST_TABLE_NAME in db_replicator.state.tables_structure
+        assert db_replicator.clickhouse_api.commands == []
 
 
 def test_enum_conversion():

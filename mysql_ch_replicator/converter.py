@@ -674,6 +674,9 @@ class MysqlToClickhouseConverter:
             logger.info(f'Skipping ALTER {alter_type.upper()} query (not applicable to ClickHouse): {mysql_query[:100]}')
             return
 
+        # get_db_and_table_name maps db_name to the target database, but resolving any other
+        # table reference in the query (e.g. the destination of a RENAME) needs the source one.
+        source_db_name = db_name
         db_name, table_name, matches_config = self.get_db_and_table_name(tokens[2], db_name)
 
         if not matches_config:
@@ -694,7 +697,10 @@ class MysqlToClickhouseConverter:
                 logger.info(f'Skipping charset/collation operation for table {table_name}: {op_name}')
                 continue
 
-            if tokens and tokens[0].lower() == 'column':
+            # RENAME needs to know whether the COLUMN keyword was present: without it,
+            # `RENAME [TO|AS] new_tbl` renames the *table*, not a column.
+            has_column_keyword = bool(tokens) and tokens[0].lower() == 'column'
+            if has_column_keyword:
                 tokens = tokens[1:]
 
             if op_name == 'add':
@@ -724,9 +730,17 @@ class MysqlToClickhouseConverter:
                 continue
 
             if op_name == 'rename':
-                if tokens and tokens[0].lower() == 'column':
-                    tokens = tokens[1:]
-                self.__convert_alter_table_rename_column(db_name, table_name, tokens)
+                # MySQL only renames a column when the COLUMN keyword is given:
+                #   RENAME COLUMN old TO new     -> column rename
+                #   RENAME {INDEX|KEY} old TO new -> index rename (no ClickHouse equivalent)
+                #   RENAME [TO|AS] new_tbl       -> table rename
+                if has_column_keyword:
+                    self.__convert_alter_table_rename_column(db_name, table_name, tokens)
+                    continue
+                if tokens and tokens[0].lower() in ('index', 'key'):
+                    logger.info(f'Skipping RENAME INDEX operation for table {table_name}')
+                    continue
+                self.__convert_alter_table_rename_table(db_name, table_name, tokens, source_db_name)
                 continue
 
             logger.error(f'Unhandled ALTER operation: {op_name}, query: {subquery}')
@@ -1060,6 +1074,50 @@ class MysqlToClickhouseConverter:
                 if 'no such column' in str(e).lower() and old_column_name in str(e):
                     logger.warning(
                         f'Column {old_column_name} might already be renamed to {new_column_name} or does not exist, continuing')
+                    return
+                raise
+
+    def __convert_alter_table_rename_table(self, db_name, table_name, tokens, source_db_name):
+        """
+        Handle the table-rename form of ALTER TABLE.
+        Example: ALTER TABLE old_name RENAME [TO|AS] new_name
+
+        The TO/AS keyword is optional in MySQL, and Liquibase's <renameTable> omits it.
+        """
+        if tokens and tokens[0].lower() in ('to', 'as'):
+            tokens = tokens[1:]
+
+        if len(tokens) != 1:
+            raise Exception('wrong tokens count for RENAME TABLE', tokens)
+
+        dest_db_name, dest_table_name, _ = self.get_db_and_table_name(tokens[0], source_db_name)
+
+        if dest_db_name != db_name:
+            raise Exception('cross databases table renames not implemented', tokens)
+
+        if self.db_replicator:
+            if table_name in self.db_replicator.state.tables_structure:
+                table_structure = self.db_replicator.state.tables_structure.pop(table_name)
+                for structure in table_structure:
+                    structure.table_name = dest_table_name
+                self.db_replicator.state.tables_structure[dest_table_name] = table_structure
+
+            # Row versions follow the rows into the renamed table. Without carrying the
+            # counter over, the new name restarts at 0 and ReplacingMergeTree would drop
+            # subsequent writes in favour of the higher-versioned rows already there.
+            last_record_versions = self.db_replicator.clickhouse_api.tables_last_record_version
+            if table_name in last_record_versions:
+                last_record_versions[dest_table_name] = last_record_versions.pop(table_name)
+
+        query = f'RENAME TABLE `{db_name}`.`{table_name}` TO `{dest_db_name}`.`{dest_table_name}`'
+        if self.db_replicator:
+            try:
+                self.db_replicator.clickhouse_api.execute_command(query)
+            except Exception as e:
+                # Table may already have been renamed (e.g. replaying a processed binlog range)
+                if 'unknown table' in str(e).lower() or "doesn't exist" in str(e).lower():
+                    logger.warning(
+                        f'Table {table_name} does not exist in ClickHouse, skipping RENAME TABLE operation')
                     return
                 raise
 
