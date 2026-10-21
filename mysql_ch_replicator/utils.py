@@ -56,10 +56,17 @@ class ProcessRunner:
         self.process.wait()
         self.run()
 
+    STOP_TIMEOUT = 30
+
     def stop(self):
         if self.process is not None:
             self.process.send_signal(signal.SIGINT)
-            self.process.wait()
+            try:
+                self.process.wait(timeout=self.STOP_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                logger.warning(f'Process did not stop in {self.STOP_TIMEOUT}s, killing: < {self.cmd} >')
+                self.process.kill()
+                self.process.wait()
             self.process = None
 
     def wait_complete(self):

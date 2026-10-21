@@ -783,6 +783,12 @@ class BinLogStreamReader(object):
                 ]
                 items = ", ".join(string_list)
                 comment = f"{parameter}: [{items}]"
+            elif isinstance(value, dict):
+                masked = {
+                    k: ("***" if k in ("passwd", "password") else v)
+                    for k, v in value.items()
+                }
+                comment = f"{parameter}: {masked}"
             else:
                 comment = f"{parameter}: {value}"
             logging.info(comment)

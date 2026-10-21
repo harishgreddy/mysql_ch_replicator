@@ -472,6 +472,19 @@ class MysqlToClickhouseConverter:
             clickhouse_type = f'Nullable({clickhouse_type})'
         return clickhouse_type
 
+    @staticmethod
+    def _keep_nullable(current_type_ch, new_type_ch):
+        # Never drop Nullable on an existing ClickHouse column: rows that already
+        # hold NULL can't be converted, the MODIFY COLUMN mutation fails forever,
+        # and every later mutation on the table (including DELETEs) queues behind it.
+        if (
+            current_type_ch.startswith('Nullable(')
+            and not new_type_ch.startswith('Nullable(')
+            and 'Tuple' not in new_type_ch
+        ):
+            return f'Nullable({new_type_ch})'
+        return new_type_ch
+
     def convert_table_structure(self, mysql_structure: TableStructure) -> TableStructure:
         clickhouse_structure = TableStructure()
         clickhouse_structure.table_name = mysql_structure.table_name
@@ -934,6 +947,8 @@ class MysqlToClickhouseConverter:
 
             # Check if column exists and already has the correct type
             existing_field = ch_table_structure.get_field(column_name)
+            if existing_field:
+                column_type_ch = self._keep_nullable(existing_field.field_type, column_type_ch)
             if existing_field and existing_field.field_type == column_type_ch:
                 logger.info(
                     f'Column {column_name} already has type {column_type_ch} in table {table_name}, skipping MODIFY COLUMN operation')
@@ -984,6 +999,7 @@ class MysqlToClickhouseConverter:
                 return
 
             current_column_type_ch = current_field.field_type
+            column_type_ch = self._keep_nullable(current_column_type_ch, column_type_ch)
 
             if current_column_type_ch != column_type_ch:
 

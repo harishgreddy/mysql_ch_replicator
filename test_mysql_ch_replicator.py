@@ -1781,6 +1781,75 @@ def test_alter_table_rename_index_skipped():
         assert db_replicator.clickhouse_api.commands == []
 
 
+def test_alter_table_not_null_keeps_clickhouse_column_nullable():
+    """
+    MySQL `MODIFY/CHANGE ... NOT NULL` on a nullable column must not drop Nullable
+    in ClickHouse: existing NULL rows can't be converted, the mutation fails forever
+    and blocks every later DELETE on the table.
+    """
+    queries = [
+        f'ALTER TABLE `{TEST_DB_NAME}`.`{TEST_TABLE_NAME}` MODIFY COLUMN invoice_type varchar(255) NOT NULL',
+        f'ALTER TABLE `{TEST_DB_NAME}`.`{TEST_TABLE_NAME}` CHANGE COLUMN invoice_type invoice_type varchar(255) NOT NULL',
+    ]
+    for query in queries:
+        converter, db_replicator = make_converter_with_table(TEST_TABLE_NAME)
+        db_replicator.state.tables_structure[TEST_TABLE_NAME] = (
+            TableStructure(fields=[TableField(name='invoice_type', field_type='varchar(255)')],
+                           table_name=TEST_TABLE_NAME),
+            TableStructure(fields=[TableField(name='invoice_type', field_type='Nullable(String)')],
+                           table_name=TEST_TABLE_NAME),
+        )
+
+        converter.convert_alter_query(query, TEST_DB_NAME)
+
+        ch_structure = db_replicator.state.tables_structure[TEST_TABLE_NAME][1]
+        assert ch_structure.get_field('invoice_type').field_type == 'Nullable(String)', query
+        assert db_replicator.clickhouse_api.commands == [], query
+
+
+def test_alter_table_modify_column_widening_keeps_nullable():
+    """A real type change on a nullable column still happens, but stays Nullable."""
+    converter, db_replicator = make_converter_with_table(TEST_TABLE_NAME)
+    db_replicator.state.tables_structure[TEST_TABLE_NAME] = (
+        TableStructure(fields=[TableField(name='qty', field_type='int')], table_name=TEST_TABLE_NAME),
+        TableStructure(fields=[TableField(name='qty', field_type='Nullable(Int32)')], table_name=TEST_TABLE_NAME),
+    )
+
+    converter.convert_alter_query(
+        f'ALTER TABLE `{TEST_DB_NAME}`.`{TEST_TABLE_NAME}` MODIFY COLUMN qty bigint NOT NULL',
+        TEST_DB_NAME,
+    )
+
+    assert db_replicator.clickhouse_api.commands == [
+        f'ALTER TABLE `{TEST_DB_NAME}`.`{TEST_TABLE_NAME}` MODIFY COLUMN `qty` Nullable(Int64)'
+    ]
+
+
+def test_clickhouse_session_locked_is_retryable():
+    from clickhouse_connect.driver.exceptions import DatabaseError, OperationalError
+    assert clickhouse_api.is_retryable_error(OperationalError('Read timed out'))
+    assert clickhouse_api.is_retryable_error(DatabaseError(
+        'Code: 373. DB::Exception: Session x is locked by a concurrent client. (SESSION_IS_LOCKED)'
+    ))
+    assert not clickhouse_api.is_retryable_error(DatabaseError('Code: 60. Table does not exist'))
+
+
+def test_process_runner_stop_kills_unresponsive_child(monkeypatch):
+    monkeypatch.setattr(ProcessRunner, 'STOP_TIMEOUT', 1)
+    # Child that ignores SIGINT, like a db_replicator stuck in a long ClickHouse query.
+    runner = ProcessRunner('ignore-sigint')
+    runner.process = subprocess.Popen(
+        ['python3', '-c', 'import signal,time;signal.signal(signal.SIGINT,signal.SIG_IGN);time.sleep(60)']
+    )
+    time.sleep(0.5)
+    process = runner.process
+    t1 = time.time()
+    runner.stop()
+    assert time.time() - t1 < 10
+    assert process.poll() is not None
+    assert runner.process is None
+
+
 def test_enum_conversion():
     """
     Test that enum values are properly converted to lowercase in ClickHouse

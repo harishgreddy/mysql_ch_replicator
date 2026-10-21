@@ -27,6 +27,20 @@ DELETE_QUERY = '''
 DELETE FROM `{db_name}`.`{table_name}` WHERE ({field_name}) IN ({field_values})
 '''
 
+CH_ERRORS = (
+    clickhouse_connect.driver.exceptions.OperationalError,
+    clickhouse_connect.driver.exceptions.DatabaseError,
+)
+
+
+def is_retryable_error(e):
+    # Network/timeout errors are retryable. SESSION_IS_LOCKED (code 373) means a
+    # previous query on our session (e.g. one that timed out client-side) is still
+    # running on the server, so waiting and retrying is the right thing to do.
+    if isinstance(e, clickhouse_connect.driver.exceptions.OperationalError):
+        return True
+    return 'SESSION_IS_LOCKED' in str(e)
+
 @dataclass
 class SingleStats:
     duration: float = 0.0
@@ -119,7 +133,9 @@ class ClickhouseApi:
             try:
                 self.client.command(query)
                 break
-            except clickhouse_connect.driver.exceptions.OperationalError as e:
+            except CH_ERRORS as e:
+                if not is_retryable_error(e):
+                    raise
                 logger.error(f'error executing command {query}: {e}', exc_info=e)
                 if attempt == ClickhouseApi.MAX_RETRIES - 1:
                     raise e
@@ -229,7 +245,9 @@ class ClickhouseApi:
                 t2 = time.time()
                 duration += (t2 - t1)
                 break
-            except clickhouse_connect.driver.exceptions.OperationalError as e:
+            except CH_ERRORS as e:
+                if not is_retryable_error(e):
+                    raise
                 logger.error(f'error inserting data: {e}', exc_info=e)
                 if attempt == ClickhouseApi.MAX_RETRIES - 1:
                     raise e
