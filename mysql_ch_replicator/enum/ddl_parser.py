@@ -44,6 +44,22 @@ def find_enum_or_set_definition_end(line: str) -> Tuple[int, str, str]:
     return -1, field_type, field_parameters
 
 
+def split_type_and_parameters(definition: List[str]) -> Tuple[str, str]:
+    """
+    Split whitespace tokens of a column definition into its type and the rest.
+    A type's argument list may hold spaces (Liquibase writes DECIMAL(18, 6)), so the
+    type runs to the token that closes its parenthesis; it is rejoined without spaces.
+    """
+    if not definition:
+        return "", ""
+    end = 0
+    depth = definition[0].count('(') - definition[0].count(')')
+    while depth > 0 and end + 1 < len(definition):
+        end += 1
+        depth += definition[end].count('(') - definition[end].count(')')
+    return ''.join(definition[:end + 1]), ' '.join(definition[end + 1:])
+
+
 def parse_enum_or_set_field(line: str, field_name: str, is_backtick_quoted: bool = False) -> Tuple[str, str, str]:
     """
     Parse a field definition line containing an enum or set type
@@ -64,9 +80,7 @@ def parse_enum_or_set_field(line: str, field_name: str, is_backtick_quoted: bool
             end_pos, field_type, field_parameters = find_enum_or_set_definition_end(line)
         else:
             # Use split() instead of split(' ') to handle multiple consecutive spaces
-            definition = line.split()
-            field_type = definition[0] if definition else ""
-            field_parameters = ' '.join(definition[1:]) if len(definition) > 1 else ''
+            field_type, field_parameters = split_type_and_parameters(line.split())
     else:
         # For non-backtick quoted fields
         # Use split() instead of split(' ') to handle multiple consecutive spaces
@@ -80,8 +94,7 @@ def parse_enum_or_set_field(line: str, field_name: str, is_backtick_quoted: bool
             line = ' '.join(definition)
             end_pos, field_type, field_parameters = find_enum_or_set_definition_end(line)
         else:
-            field_type = definition[0] if definition else ""
-            field_parameters = ' '.join(definition[1:]) if len(definition) > 1 else ''
+            field_type, field_parameters = split_type_and_parameters(definition)
     
     return field_name, field_type, field_parameters
 

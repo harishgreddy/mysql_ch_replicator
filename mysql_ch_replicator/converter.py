@@ -400,6 +400,11 @@ class MysqlToClickhouseConverter:
             if is_unsigned:
                 return 'UInt32'
             return 'Int32'
+        datetime_match = re.match(r'^datetime(?:\((\d+)\))?$', mysql_type)
+        if datetime_match:
+            # DATETIME has no zone; rows are written as naive datetimes, read in the
+            # process zone, and the replicator runs in UTC, so say so on the column.
+            return f"DateTime64({datetime_match.group(1) or 0}, 'UTC')"
         if 'datetime' in mysql_type:
             return mysql_type.replace('datetime', 'DateTime64')
         if 'longtext' in mysql_type:
@@ -426,6 +431,12 @@ class MysqlToClickhouseConverter:
             return 'String'
         if 'json' in mysql_type:
             return 'String'
+        decimal_match = re.match(r'^decimal(?:\((\d+)\s*(?:,\s*(\d+))?\))?$', mysql_type)
+        if decimal_match:
+            # Keep precision and scale: Float64 holds about 15.9 digits, decimal(18,6) needs 18.
+            precision = decimal_match.group(1) or 10
+            scale = decimal_match.group(2) or 0
+            return f'Decimal({precision}, {scale})'
         if 'decimal' in mysql_type:
             return 'Float64'
         if 'float' in mysql_type:
@@ -1229,7 +1240,9 @@ class MysqlToClickhouseConverter:
         raise Exception('not implement')
 
     def _strip_comments(self, create_statement):
-        pattern = r'\bCOMMENT(?:\s*=\s*|\s+)([\'"])(?:\\.|[^\\])*?\1'
+        # A quote inside a comment is either backslash-escaped or doubled ('' as MySQL and
+        # Liquibase write it); a lazy match up to the next quote would end inside the comment.
+        pattern = r'''\bCOMMENT(?:\s*=\s*|\s+)(?:'(?:[^'\\]|\\.|'')*'|"(?:[^"\\]|\\.|"")*")'''
         return re.sub(pattern, '', create_statement, flags=re.IGNORECASE)
 
     def parse_mysql_table_structure(self, create_statement, required_table_name=None):

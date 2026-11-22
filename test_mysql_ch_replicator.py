@@ -7,6 +7,7 @@ import subprocess
 import json
 import uuid
 import decimal
+import re
 import tempfile
 import yaml
 
@@ -3275,3 +3276,192 @@ def test_resume_initial_replication_with_ignore_deletes():
     finally:
         # Clean up temp config file
         os.unlink(config_file)
+
+
+PLAN_CENTRAL_DDL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tests_data', 'plan_central')
+PLAN_CENTRAL_DDL_TABLES = [
+    # SHOW CREATE TABLE output of tables whose comments hold a SQL-escaped apostrophe ('').
+    'capacity', 'capacity_outage', 'disassembly_program', 'network_node',
+    'opening_make_order', 'opening_stock_position', 'planning_product',
+    # decimal and datetime(6) columns without an apostrophe
+    'price', 'uom',
+]
+
+
+def _expected_clickhouse_type(mysql_type, column_definition):
+    decimal_match = re.match(r'^decimal\((\d+),(\d+)\)$', mysql_type)
+    if decimal_match:
+        expected = f'Decimal({decimal_match.group(1)}, {decimal_match.group(2)})'
+    elif mysql_type == 'datetime(6)':
+        expected = "DateTime64(6, 'UTC')"
+    else:
+        return None
+    if 'NOT NULL' not in column_definition:
+        expected = f'Nullable({expected})'
+    return expected
+
+
+@pytest.mark.parametrize('table_name', PLAN_CENTRAL_DDL_TABLES)
+def test_parse_show_create_table_of_plan_central(table_name):
+    """
+    Real SHOW CREATE TABLE output: every column survives comment stripping (MySQL writes an
+    apostrophe in a comment as ''), decimals keep their precision and scale, and datetime(6)
+    states its zone.
+    """
+    with open(os.path.join(PLAN_CENTRAL_DDL_DIR, f'{table_name}.sql')) as f:
+        create_table_query = f.read()
+    column_lines = re.findall(r'^\s+`(\w+)` (\S+)(.*)$', create_table_query, re.MULTILINE)
+
+    converter = MysqlToClickhouseConverter()
+    mysql_structure, ch_structure = converter.parse_create_table_query(create_table_query)
+
+    assert mysql_structure.table_name == table_name
+    assert [field.name for field in mysql_structure.fields] == [name for name, _, _ in column_lines]
+    assert mysql_structure.primary_keys == ['id']
+    for (name, mysql_type, rest), ch_field in zip(column_lines, ch_structure.fields):
+        expected = _expected_clickhouse_type(mysql_type, rest)
+        if expected is not None:
+            assert ch_field.field_type == expected, name
+
+
+def test_strip_comments_handles_doubled_and_backslash_escaped_quotes():
+    create_table_query = """CREATE TABLE `site` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `status` varchar(16) NOT NULL DEFAULT 'ACTIVE' COMMENT 'PROPOSED (a planner''s addition), ACTIVE or INACTIVE',
+  `note` varchar(100) DEFAULT NULL COMMENT 'it\\'s backslash-escaped, then ''doubled'' twice',
+  `label` varchar(100) DEFAULT NULL COMMENT "say ""hi"" in quotes",
+  `weight_kg` decimal(18,6) DEFAULT NULL COMMENT 'the input''s own weight, not live weight',
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='One row per site; the site''s own code.'"""
+
+    converter = MysqlToClickhouseConverter()
+    stripped = converter._strip_comments(create_table_query)
+    mysql_structure, ch_structure = converter.parse_create_table_query(create_table_query)
+
+    assert 'COMMENT' not in stripped
+    assert "DEFAULT 'ACTIVE'" in stripped
+    assert [field.name for field in mysql_structure.fields] == ['id', 'status', 'note', 'label', 'weight_kg']
+    assert [field.field_type for field in ch_structure.fields] == [
+        'Int64', 'String', 'Nullable(String)', 'Nullable(String)', 'Nullable(Decimal(18, 6))',
+    ]
+
+
+def test_parse_liquibase_create_table_from_binlog():
+    """Realtime DDL as Liquibase writes it: upper-case types, 'decimal(18, 6)' with a space, a named PK constraint."""
+    create_table_query = (
+        "CREATE TABLE plan_central.price (id BIGINT AUTO_INCREMENT NOT NULL, "
+        "organization_code VARCHAR(50) NOT NULL, "
+        "amount DECIMAL(18, 6) NOT NULL COMMENT 'The price''s amount, per pricing quantity', "
+        "pricing_quantity DECIMAL(18, 9) NULL, "
+        "conversion_factor DECIMAL(24, 15) NOT NULL, "
+        "share DECIMAL(7, 6) NULL, "
+        "created_date datetime(6) NOT NULL, "
+        "last_modified_date datetime(6) NULL, "
+        "CONSTRAINT PK_PRICE PRIMARY KEY (id)) COMMENT='One price; the product''s list price.'"
+    )
+
+    converter = MysqlToClickhouseConverter()
+    mysql_structure, ch_structure = converter.parse_create_table_query(create_table_query)
+
+    assert mysql_structure.table_name == 'price'
+    assert mysql_structure.primary_keys == ['id']
+    assert [field.field_type for field in ch_structure.fields] == [
+        'Int64',
+        'String',
+        'Decimal(18, 6)',
+        'Nullable(Decimal(18, 9))',
+        'Decimal(24, 15)',
+        'Nullable(Decimal(7, 6))',
+        "DateTime64(6, 'UTC')",
+        "Nullable(DateTime64(6, 'UTC'))",
+    ]
+
+
+@pytest.mark.parametrize('mysql_type,expected', [
+    ('decimal(18,6)', 'Decimal(18, 6)'),
+    ('decimal(18, 6)', 'Decimal(18, 6)'),
+    ('DECIMAL(24,15)', 'Decimal(24, 15)'),
+    ('decimal(7,6)', 'Decimal(7, 6)'),
+    ('decimal(65,30)', 'Decimal(65, 30)'),
+    ('decimal(12)', 'Decimal(12, 0)'),
+    ('decimal', 'Decimal(10, 0)'),
+    ('datetime(6)', "DateTime64(6, 'UTC')"),
+    ('datetime(3)', "DateTime64(3, 'UTC')"),
+    ('datetime', "DateTime64(0, 'UTC')"),
+])
+def test_decimal_and_datetime_type_mapping(mysql_type, expected):
+    converter = MysqlToClickhouseConverter()
+    assert converter.convert_field_type(mysql_type, 'not null') == expected
+    assert converter.convert_field_type(mysql_type, '') == f'Nullable({expected})'
+
+
+def test_types_mapping_still_overrides_decimal():
+    mock_replicator = type('R', (), {})()
+    mock_replicator.config = type('C', (), {'types_mapping': {'decimal(18,6)': 'Float64'}})()
+    converter = MysqlToClickhouseConverter(db_replicator=mock_replicator)
+    assert converter.convert_field_type('decimal(18,6)', 'not null') == 'Float64'
+
+
+def test_convert_record_keeps_decimal_values_exact():
+    mysql_structure = TableStructure(
+        fields=[TableField(name='id', field_type='bigint'), TableField(name='amount', field_type='decimal(18,6)')],
+        primary_keys=['id'],
+        table_name='price',
+    )
+    converter = MysqlToClickhouseConverter()
+    ch_structure = converter.convert_table_structure(mysql_structure)
+
+    records = converter.convert_records(
+        [(1, decimal.Decimal('123456789012.123456'))], mysql_structure, ch_structure,
+    )
+
+    assert records == [(1, decimal.Decimal('123456789012.123456'))]
+
+
+def test_alter_table_add_decimal_and_datetime_columns_as_liquibase_writes_them():
+    converter, db_replicator = make_converter_with_table(
+        TEST_TABLE_NAME, fields=[TableField(name='id', field_type='bigint')],
+    )
+
+    converter.convert_alter_query(
+        f'ALTER TABLE {TEST_DB_NAME}.{TEST_TABLE_NAME} ADD amount DECIMAL(18, 6) NULL',
+        TEST_DB_NAME,
+    )
+    converter.convert_alter_query(
+        f'ALTER TABLE {TEST_DB_NAME}.{TEST_TABLE_NAME} ADD confirmed_at datetime(6) NOT NULL',
+        TEST_DB_NAME,
+    )
+
+    assert db_replicator.clickhouse_api.commands == [
+        f'ALTER TABLE `{TEST_DB_NAME}`.`{TEST_TABLE_NAME}` ADD COLUMN `amount` Nullable(Decimal(18, 6)) AFTER id',
+        f"ALTER TABLE `{TEST_DB_NAME}`.`{TEST_TABLE_NAME}` ADD COLUMN `confirmed_at` DateTime64(6, 'UTC') AFTER amount",
+    ]
+
+
+def test_realtime_create_table_skips_unlisted_table_before_parsing_it():
+    """A table the config leaves out never stops replication, even when its DDL cannot be parsed."""
+    from mysql_ch_replicator.db_replicator_realtime import DbReplicatorRealtime, created_table_name
+
+    cfg = config.Settings()
+    cfg.load(CONFIG_FILE)
+    cfg.tables = ['kept']
+    db_replicator = FakeDbReplicator(cfg, TEST_DB_NAME)
+    db_replicator.converter = MysqlToClickhouseConverter(db_replicator)
+    realtime = DbReplicatorRealtime(db_replicator)
+
+    for unparseable in [
+        "CREATE TABLE `skipped` (`id` bigint NOT NULL, `x` weird_type(1) NOT NULL, PRIMARY KEY (`id`))",
+        "create table if not exists plan_central.skipped (id bigint not null, x weird_type(1), primary key (id))",
+        f"CREATE TABLE `{TEST_DB_NAME}`.`skipped` LIKE `{TEST_DB_NAME}`.`missing`",
+    ]:
+        realtime.handle_create_table_query(unparseable, TEST_DB_NAME)
+
+    assert db_replicator.state.tables_structure == {}
+    assert created_table_name("CREATE TABLE plan_central.price (id BIGINT NOT NULL)") == 'price'
+    assert created_table_name("create table if not exists `plan-central`.`price` (id bigint)") == 'price'
+
+    with pytest.raises(Exception, match='unknown mysql type'):
+        realtime.handle_create_table_query(
+            "CREATE TABLE `kept` (`id` bigint NOT NULL, `x` weird_type(1) NOT NULL, PRIMARY KEY (`id`))",
+            TEST_DB_NAME,
+        )
