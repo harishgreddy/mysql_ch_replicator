@@ -663,12 +663,12 @@ class MysqlToClickhouseConverter:
                 # This is a target database name, so for config matching we need to use the source database
                 matches_config = (
                         self.db_replicator.config.is_database_matches(self.db_replicator.database)
-                        and self.db_replicator.config.is_table_matches(table_name))
+                        and self.db_replicator.config.is_table_matches(self.db_replicator.database, table_name))
             else:
                 # Normal case: check if source database and table match config
                 matches_config = (
                         self.db_replicator.config.is_database_matches(db_name)
-                        and self.db_replicator.config.is_table_matches(table_name))
+                        and self.db_replicator.config.is_table_matches(db_name, table_name))
 
             # Apply database mapping AFTER checking matches_config
             if db_name == self.db_replicator.database:

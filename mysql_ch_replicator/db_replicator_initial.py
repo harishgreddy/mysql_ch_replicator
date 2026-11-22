@@ -35,7 +35,7 @@ class DbReplicatorInitial:
         self.replicator.state.save()
 
     def create_initial_structure_table(self, table_name):
-        if not self.replicator.config.is_table_matches(table_name):
+        if not self.replicator.config.is_table_matches(self.replicator.database, table_name):
             return
 
         if self.replicator.single_table and self.replicator.single_table != table_name:
@@ -128,7 +128,7 @@ class DbReplicatorInitial:
     def perform_initial_replication_table(self, table_name):
         logger.info(f'running initial replication for table {table_name}')
 
-        if not self.replicator.config.is_table_matches(table_name):
+        if not self.replicator.config.is_table_matches(self.replicator.database, table_name):
             logger.info(f'skip table {table_name} - not matching any allowed table')
             return
 
@@ -246,7 +246,7 @@ class DbReplicatorInitial:
         changed_tables = []
         
         for table_name in self.replicator.state.tables:
-            if not self.replicator.config.is_table_matches(table_name):
+            if not self.replicator.config.is_table_matches(self.replicator.database, table_name):
                 continue
                 
             if self.replicator.single_table and self.replicator.single_table != table_name:

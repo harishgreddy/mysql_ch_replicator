@@ -425,6 +425,11 @@ class BinlogReplicator:
                 return m.group('dbname_unquoted')
         return ''
 
+    @staticmethod
+    def is_row_event_wanted(settings, db_name, table_name):
+        # Table patterns may be scoped per database, so the row's own database decides.
+        return settings.is_database_matches(db_name) and settings.is_table_matches(db_name, table_name)
+
     def run(self):
         last_transaction_id = None
 
@@ -457,18 +462,18 @@ class BinlogReplicator:
                         continue
 
                     log_event = LogEvent()
+                    log_event.db_name = event.schema
+
+                    if isinstance(log_event.db_name, bytes):
+                        log_event.db_name = log_event.db_name.decode('utf-8')
+
                     if hasattr(event, 'table'):
                         log_event.table_name = event.table
                         if isinstance(log_event.table_name, bytes):
                             log_event.table_name = log_event.table_name.decode('utf-8')
 
-                        if not self.settings.is_table_matches(log_event.table_name):
+                        if not self.is_row_event_wanted(self.settings, log_event.db_name, log_event.table_name):
                             continue
-
-                    log_event.db_name = event.schema
-
-                    if isinstance(log_event.db_name, bytes):
-                        log_event.db_name = log_event.db_name.decode('utf-8')
 
                     if isinstance(event, UpdateRowsEvent) or isinstance(event, WriteRowsEvent):
                         log_event.event_type = EventType.ADD_EVENT.value

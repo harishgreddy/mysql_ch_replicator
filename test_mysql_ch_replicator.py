@@ -3465,3 +3465,83 @@ def test_realtime_create_table_skips_unlisted_table_before_parsing_it():
             "CREATE TABLE `kept` (`id` bigint NOT NULL, `x` weird_type(1) NOT NULL, PRIMARY KEY (`id`))",
             TEST_DB_NAME,
         )
+
+
+def _settings_from_yaml(text):
+    with tempfile.NamedTemporaryFile('w', suffix='.yaml', delete=False) as f:
+        f.write(text)
+    try:
+        cfg = config.Settings()
+        cfg.load(f.name)
+        return cfg
+    finally:
+        os.unlink(f.name)
+
+
+SETTINGS_BASE = """
+mysql: {host: localhost, port: 3306, user: root, password: ''}
+clickhouse: {host: localhost, port: 8123, user: default, password: ''}
+binlog_replicator: {data_dir: /tmp/binlog, records_per_file: 100000}
+databases: ['plan_central', 'erp_source']
+"""
+
+
+def test_tables_scoped_per_database():
+    """An allow-list for one database leaves every other database replicating all its tables."""
+    cfg = _settings_from_yaml(SETTINGS_BASE + """
+tables:
+  plan_central: ['price', 'uom', 'decision_point*']
+exclude_tables:
+  erp_source: ['DATABASECHANGELOG', 'aggregated_*']
+""")
+
+    assert cfg.is_table_matches('plan_central', 'price')
+    assert cfg.is_table_matches('plan_central', 'decision_point_weekly_share')
+    assert not cfg.is_table_matches('plan_central', 'ingestion_source')
+    assert not cfg.is_table_matches('plan_central', 'DATABASECHANGELOG')
+
+    assert cfg.is_table_matches('erp_source', 'ingestion_source')
+    assert cfg.is_table_matches('erp_source', 'price')
+    assert not cfg.is_table_matches('erp_source', 'DATABASECHANGELOG')
+    assert not cfg.is_table_matches('erp_source', 'aggregated_stock_summary')
+
+    assert cfg.is_table_matches('other_db', 'anything')
+
+
+def test_tables_and_exclude_tables_as_global_lists_apply_to_every_database():
+    cfg = _settings_from_yaml(SETTINGS_BASE + """
+tables: ['price', 'uom', 'DATABASECHANGELOG']
+exclude_tables: ['DATABASECHANGELOG']
+""")
+
+    for db_name in ('plan_central', 'erp_source'):
+        assert cfg.is_table_matches(db_name, 'price')
+        assert not cfg.is_table_matches(db_name, 'ingestion_source')
+        assert not cfg.is_table_matches(db_name, 'DATABASECHANGELOG')
+
+
+def test_tables_default_to_every_table():
+    cfg = _settings_from_yaml(SETTINGS_BASE)
+    assert cfg.is_table_matches('plan_central', 'ingestion_source')
+
+
+@pytest.mark.parametrize('bad', [
+    "tables: {plan_central: 5}",
+    "exclude_tables: {plan_central: [1]}",
+    "tables: 5",
+])
+def test_table_patterns_of_the_wrong_shape_are_refused(bad):
+    with pytest.raises((ValueError, AssertionError)):
+        _settings_from_yaml(SETTINGS_BASE + bad + "\n")
+
+
+def test_binlog_filter_reads_the_row_event_database_before_the_table():
+    """The binlog replicator keeps a row event only when its own database lists the table."""
+    cfg = _settings_from_yaml(SETTINGS_BASE + """
+tables:
+  plan_central: ['price']
+""")
+    assert BinlogReplicator.is_row_event_wanted(cfg, 'plan_central', 'price')
+    assert not BinlogReplicator.is_row_event_wanted(cfg, 'plan_central', 'ingestion_source')
+    assert BinlogReplicator.is_row_event_wanted(cfg, 'erp_source', 'ingestion_source')
+    assert not BinlogReplicator.is_row_event_wanted(cfg, 'unlisted_db', 'price')

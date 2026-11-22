@@ -104,7 +104,7 @@ class DbReplicatorRealtime:
             EventType.QUERY.value: self.handle_query_event,
         }
 
-        if not event.table_name or self.replicator.config.is_table_matches(event.table_name):
+        if not event.table_name or self.replicator.config.is_table_matches(self.replicator.database, event.table_name):
             event_handlers[event.event_type](event)
 
         self.replicator.stats.events_count += 1
@@ -249,10 +249,10 @@ class DbReplicatorRealtime:
         # Check the config before parsing: DDL the parser cannot read must not stop
         # replication when the table is not replicated at all.
         table_name = created_table_name(query)
-        if table_name is not None and not self.replicator.config.is_table_matches(table_name):
+        if table_name is not None and not self.replicator.config.is_table_matches(self.replicator.database, table_name):
             return
         mysql_structure, ch_structure = self.replicator.converter.parse_create_table_query(query)
-        if not self.replicator.config.is_table_matches(mysql_structure.table_name):
+        if not self.replicator.config.is_table_matches(self.replicator.database, mysql_structure.table_name):
             return
         self.replicator.state.tables_structure[mysql_structure.table_name] = (mysql_structure, ch_structure)
         indexes = self.replicator.config.get_indexes(self.replicator.database, ch_structure.table_name)

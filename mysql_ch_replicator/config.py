@@ -175,7 +175,8 @@ class Settings:
             )
         
         assert isinstance(self.databases, str) or isinstance(self.databases, list)
-        assert isinstance(self.tables, str) or isinstance(self.tables, list)
+        self.validate_table_patterns('tables', self.tables)
+        self.validate_table_patterns('exclude_tables', self.exclude_tables)
         self.binlog_replicator = BinlogReplicatorSettings(**data.pop('binlog_replicator'))
         if data:
             raise Exception(f'Unsupported config options: {list(data.keys())}')
@@ -199,10 +200,28 @@ class Settings:
             return False
         return self.is_pattern_matches(db_name, self.databases)
 
-    def is_table_matches(self, table_name):
-        if self.exclude_tables and self.is_pattern_matches(table_name, self.exclude_tables):
+    @staticmethod
+    def validate_table_patterns(option, patterns):
+        # A plain string or list applies to every database; a mapping scopes the patterns
+        # to the source database named by each key.
+        scoped = patterns.values() if isinstance(patterns, dict) else [patterns]
+        for value in scoped:
+            is_list = isinstance(value, list) and all(isinstance(v, str) for v in value)
+            if not (isinstance(value, str) or is_list):
+                raise ValueError(f'{option} should be a pattern, a list of patterns, '
+                                 f'or a mapping of database to those, not {value!r}')
+
+    @staticmethod
+    def table_patterns_for(patterns, db_name, default):
+        if isinstance(patterns, dict):
+            return patterns.get(db_name, default)
+        return patterns
+
+    def is_table_matches(self, db_name, table_name):
+        exclude_tables = self.table_patterns_for(self.exclude_tables, db_name, '')
+        if exclude_tables and self.is_pattern_matches(table_name, exclude_tables):
             return False
-        return self.is_pattern_matches(table_name, self.tables)
+        return self.is_pattern_matches(table_name, self.table_patterns_for(self.tables, db_name, '*'))
 
     def validate_log_level(self):
         if self.log_level not in ['critical', 'error', 'warning', 'info', 'debug']:
