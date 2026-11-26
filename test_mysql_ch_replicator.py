@@ -3332,7 +3332,7 @@ def test_parse_show_create_table_of_plan_central(table_name):
         create_table_query = f.read()
     column_lines = re.findall(r'^\s+`(\w+)` (\S+)(.*)$', create_table_query, re.MULTILINE)
 
-    converter = MysqlToClickhouseConverter()
+    converter = MysqlToClickhouseConverter(exact_decimals=True)
     mysql_structure, ch_structure = converter.parse_create_table_query(create_table_query)
 
     assert mysql_structure.table_name == table_name
@@ -3354,7 +3354,7 @@ def test_strip_comments_handles_doubled_and_backslash_escaped_quotes():
   PRIMARY KEY (`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='One row per site; the site''s own code.'"""
 
-    converter = MysqlToClickhouseConverter()
+    converter = MysqlToClickhouseConverter(exact_decimals=True)
     stripped = converter._strip_comments(create_table_query)
     mysql_structure, ch_structure = converter.parse_create_table_query(create_table_query)
 
@@ -3380,7 +3380,7 @@ def test_parse_liquibase_create_table_from_binlog():
         "CONSTRAINT PK_PRICE PRIMARY KEY (id)) COMMENT='One price; the product''s list price.'"
     )
 
-    converter = MysqlToClickhouseConverter()
+    converter = MysqlToClickhouseConverter(exact_decimals=True)
     mysql_structure, ch_structure = converter.parse_create_table_query(create_table_query)
 
     assert mysql_structure.table_name == 'price'
@@ -3410,16 +3410,40 @@ def test_parse_liquibase_create_table_from_binlog():
     ('datetime', "DateTime64(0, 'UTC')"),
 ])
 def test_decimal_and_datetime_type_mapping(mysql_type, expected):
-    converter = MysqlToClickhouseConverter()
+    converter = MysqlToClickhouseConverter(exact_decimals=True)
     assert converter.convert_field_type(mysql_type, 'not null') == expected
     assert converter.convert_field_type(mysql_type, '') == f'Nullable({expected})'
 
 
 def test_types_mapping_still_overrides_decimal():
-    mock_replicator = type('R', (), {})()
-    mock_replicator.config = type('C', (), {'types_mapping': {'decimal(18,6)': 'Float64'}})()
+    mock_replicator = type('R', (), {'database': 'plan_central'})()
+    mock_replicator.config = type('C', (), {
+        'types_mapping': {'decimal(18,6)': 'Float64'},
+        'is_exact_decimals': lambda self, db_name: True,
+    })()
     converter = MysqlToClickhouseConverter(db_replicator=mock_replicator)
     assert converter.convert_field_type('decimal(18,6)', 'not null') == 'Float64'
+
+
+def test_decimal_maps_to_float_unless_exact_decimals():
+    assert MysqlToClickhouseConverter().convert_field_type('decimal(18,6)', 'not null') == 'Float64'
+    assert MysqlToClickhouseConverter().convert_field_type('decimal(18,6)', '') == 'Nullable(Float64)'
+    assert MysqlToClickhouseConverter(exact_decimals=True).convert_field_type('decimal(18,6)', 'not null') == 'Decimal(18, 6)'
+
+
+def test_exact_decimals_config_is_scoped_to_named_databases():
+    cfg = config.Settings()
+    cfg.load(CONFIG_FILE)
+    assert not cfg.is_exact_decimals('plan_central')
+
+    cfg.exact_decimals = ['plan_central']
+    assert cfg.is_exact_decimals('plan_central')
+    assert not cfg.is_exact_decimals('livine_demo_erp_planning_source')
+
+    converter = MysqlToClickhouseConverter(FakeDbReplicator(cfg, 'livine_demo_erp_planning_source'))
+    assert converter.convert_field_type('decimal(20,10)', '') == 'Nullable(Float64)'
+    converter = MysqlToClickhouseConverter(FakeDbReplicator(cfg, 'plan_central'))
+    assert converter.convert_field_type('decimal(20,10)', '') == 'Nullable(Decimal(20, 10))'
 
 
 def test_convert_record_keeps_decimal_values_exact():
@@ -3442,6 +3466,7 @@ def test_alter_table_add_decimal_and_datetime_columns_as_liquibase_writes_them()
     converter, db_replicator = make_converter_with_table(
         TEST_TABLE_NAME, fields=[TableField(name='id', field_type='bigint')],
     )
+    converter.exact_decimals = True
 
     converter.convert_alter_query(
         f'ALTER TABLE {TEST_DB_NAME}.{TEST_TABLE_NAME} ADD amount DECIMAL(18, 6) NULL',

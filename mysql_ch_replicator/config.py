@@ -128,6 +128,7 @@ class Settings:
         self.http_host = ''
         self.http_port = 0
         self.types_mapping = {}
+        self.exact_decimals = ''
         self.target_databases = {}
         self.initial_replication_threads = 0
         self.ignore_deletes = False
@@ -154,6 +155,7 @@ class Settings:
             'auto_restart_interval', Settings.DEFAULT_AUTO_RESTART_INTERVAL,
         )
         self.types_mapping = data.pop('types_mapping', {})
+        self.exact_decimals = data.pop('exact_decimals', '')
         self.http_host = data.pop('http_host', '')
         self.http_port = data.pop('http_port', 0)
         self.target_databases = data.pop('target_databases', {})
@@ -177,6 +179,8 @@ class Settings:
         assert isinstance(self.databases, str) or isinstance(self.databases, list)
         self.validate_table_patterns('tables', self.tables)
         self.validate_table_patterns('exclude_tables', self.exclude_tables)
+        if not (isinstance(self.exact_decimals, str) or (isinstance(self.exact_decimals, list) and all(isinstance(d, str) for d in self.exact_decimals))):
+            raise ValueError(f'exact_decimals should be a database pattern or a list of them, not {self.exact_decimals!r}')
         self.binlog_replicator = BinlogReplicatorSettings(**data.pop('binlog_replicator'))
         if data:
             raise Exception(f'Unsupported config options: {list(data.keys())}')
@@ -194,6 +198,10 @@ class Settings:
                     return True
             return False
         raise ValueError()
+
+    def is_exact_decimals(self, db_name):
+        # Databases whose DECIMAL columns keep precision as ClickHouse Decimal(p, s); others get Float64.
+        return bool(self.exact_decimals) and self.is_pattern_matches(db_name, self.exact_decimals)
 
     def is_database_matches(self, db_name):
         if self.exclude_databases and self.is_pattern_matches(db_name, self.exclude_databases):

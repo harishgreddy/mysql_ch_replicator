@@ -241,11 +241,13 @@ def convert_timestamp_to_datetime64(input_str, timezone='UTC'):
 
 
 class MysqlToClickhouseConverter:
-    def __init__(self, db_replicator: 'DbReplicator' = None):
+    def __init__(self, db_replicator: 'DbReplicator' = None, exact_decimals: bool = False):
         self.db_replicator = db_replicator
         self.types_mapping = {}
+        self.exact_decimals = exact_decimals
         if self.db_replicator is not None:
             self.types_mapping = db_replicator.config.types_mapping
+            self.exact_decimals = db_replicator.config.is_exact_decimals(db_replicator.database)
 
     @staticmethod
     def _extract_parenthesized_expression(line, start_pos):
@@ -432,7 +434,7 @@ class MysqlToClickhouseConverter:
         if 'json' in mysql_type:
             return 'String'
         decimal_match = re.match(r'^decimal(?:\((\d+)\s*(?:,\s*(\d+))?\))?$', mysql_type)
-        if decimal_match:
+        if decimal_match and self.exact_decimals:
             # Keep precision and scale: Float64 holds about 15.9 digits, decimal(18,6) needs 18.
             precision = decimal_match.group(1) or 10
             scale = decimal_match.group(2) or 0
