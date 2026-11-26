@@ -472,10 +472,11 @@ class MysqlToClickhouseConverter:
             return 'UInt8'  # MySQL BOOLEAN is an alias for TINYINT(1), stores 0 or 1
         raise Exception(f'unknown mysql type "{mysql_type}"')
 
-    def convert_field_type(self, mysql_type, mysql_parameters):
+    def convert_field_type(self, mysql_type, mysql_parameters, primary_key=False):
         mysql_type = mysql_type.lower()
         mysql_parameters = mysql_parameters.lower()
-        not_null = 'not null' in mysql_parameters
+        # MySQL makes every primary key column NOT NULL, whether or not the DDL says so.
+        not_null = primary_key or 'not null' in mysql_parameters
         clickhouse_type = self.convert_type(mysql_type, mysql_parameters)
         if 'Tuple' in clickhouse_type:
             not_null = True
@@ -501,7 +502,9 @@ class MysqlToClickhouseConverter:
         clickhouse_structure.table_name = mysql_structure.table_name
         clickhouse_structure.if_not_exists = mysql_structure.if_not_exists
         for field in mysql_structure.fields:
-            clickhouse_field_type = self.convert_field_type(field.field_type, field.parameters)
+            clickhouse_field_type = self.convert_field_type(
+                field.field_type, field.parameters, primary_key=field.name in mysql_structure.primary_keys,
+            )
             clickhouse_structure.fields.append(TableField(
                 name=field.name,
                 field_type=clickhouse_field_type,

@@ -1456,6 +1456,26 @@ def test_parse_mysql_table_structure():
     assert structure.table_name == 'user_preferences_portal'
 
 
+def test_inline_primary_key_column_is_not_nullable():
+    query = (
+        "CREATE TABLE store_customer_migration_before (\n"
+        "  id BIGINT AUTO_INCREMENT PRIMARY KEY,\n"
+        "  ref_table VARCHAR(64) NOT NULL,\n"
+        "  store_customer_id BIGINT NULL,\n"
+        "  UNIQUE KEY uk_before (ref_table, store_customer_id)\n"
+        ")"
+    )
+    converter = MysqlToClickhouseConverter()
+
+    structure = converter.convert_table_structure(converter.parse_mysql_table_structure(query))
+
+    types = {field.name: field.field_type for field in structure.fields}
+    assert structure.primary_keys == ['id']
+    assert types['id'] == 'Int64'
+    assert types['ref_table'] == 'String'
+    assert types['store_customer_id'] == 'Nullable(Int64)'
+
+
 def get_last_file(directory, extension='.bin'):
     max_num = -1
     last_file = None
