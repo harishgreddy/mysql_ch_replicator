@@ -3462,6 +3462,22 @@ def test_convert_record_keeps_decimal_values_exact():
     assert records == [(1, decimal.Decimal('123456789012.123456'))]
 
 
+def test_convert_record_keeps_null_bit_flag_null():
+    mysql_structure = TableStructure(
+        fields=[TableField(name='id', field_type='bigint'), TableField(name='flag', field_type='bit(1)')],
+        primary_keys=['id'],
+        table_name='customer_order',
+    )
+    converter = MysqlToClickhouseConverter()
+    ch_structure = converter.convert_table_structure(mysql_structure)
+
+    records = converter.convert_records(
+        [(1, None), (2, b'\x01'), (3, b'\x00')], mysql_structure, ch_structure,
+    )
+
+    assert records == [(1, None), (2, True), (3, False)]
+
+
 def test_alter_table_add_decimal_and_datetime_columns_as_liquibase_writes_them():
     converter, db_replicator = make_converter_with_table(
         TEST_TABLE_NAME, fields=[TableField(name='id', field_type='bigint')],

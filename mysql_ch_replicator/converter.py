@@ -544,8 +544,9 @@ class MysqlToClickhouseConverter:
             mysql_field_type = mysql_field_types[idx]
             clickhouse_field_type = clickhouse_field_types[idx]
 
-            # --- Fix for BIT(1) fields ---
-            if mysql_field_type.startswith('bit(') and mysql_field_type.endswith(')'):
+            # --- Fix for BIT(1) fields --- (a NULL stays NULL: bool(None) would turn it into false)
+            if (clickhouse_field_value is not None
+                    and mysql_field_type.startswith('bit(') and mysql_field_type.endswith(')')):
                 try:
                     bit_len = int(mysql_field_type[4:-1])
                     if bit_len == 1 and 'Bool' in clickhouse_field_type:
