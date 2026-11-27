@@ -1,5 +1,6 @@
 import json
 import os.path
+import re
 import time
 from logging import getLogger
 from collections import defaultdict
@@ -9,10 +10,21 @@ import sqlparse
 from .binlog_replicator import LogEvent, EventType
 from .table_structure import TableStructure
 from .utils import GracefulKiller, touch_all_files, format_floats
-from .converter import strip_sql_comments
+from .converter import strip_sql_comments, strip_sql_name
 from .common import Status
 
 logger = getLogger(__name__)
+
+CREATE_TABLE_NAME = re.compile(
+    r'^\s*create\s+(?:temporary\s+)?table\s+(?:if\s+not\s+exists\s+)?'
+    r'(?:(?:`[^`]+`|[\w$]+)\s*\.\s*)?(`[^`]+`|[\w$]+)',
+    re.IGNORECASE,
+)
+
+
+def created_table_name(query):
+    match = CREATE_TABLE_NAME.match(query)
+    return strip_sql_name(match.group(1)) if match else None
 
 
 class DbReplicatorRealtime:
@@ -92,7 +104,7 @@ class DbReplicatorRealtime:
             EventType.QUERY.value: self.handle_query_event,
         }
 
-        if not event.table_name or self.replicator.config.is_table_matches(event.table_name):
+        if not event.table_name or self.replicator.config.is_table_matches(self.replicator.database, event.table_name):
             event_handlers[event.event_type](event)
 
         self.replicator.stats.events_count += 1
@@ -234,8 +246,13 @@ class DbReplicatorRealtime:
         self.replicator.converter.convert_alter_query(query, db_name)
 
     def handle_create_table_query(self, query, db_name):
+        # Check the config before parsing: DDL the parser cannot read must not stop
+        # replication when the table is not replicated at all.
+        table_name = created_table_name(query)
+        if table_name is not None and not self.replicator.config.is_table_matches(self.replicator.database, table_name):
+            return
         mysql_structure, ch_structure = self.replicator.converter.parse_create_table_query(query)
-        if not self.replicator.config.is_table_matches(mysql_structure.table_name):
+        if not self.replicator.config.is_table_matches(self.replicator.database, mysql_structure.table_name):
             return
         self.replicator.state.tables_structure[mysql_structure.table_name] = (mysql_structure, ch_structure)
         indexes = self.replicator.config.get_indexes(self.replicator.database, ch_structure.table_name)

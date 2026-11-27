@@ -80,7 +80,7 @@ class DbOptimizer:
         self.mysql_api.set_database(db_name)
         tables = self.mysql_api.get_tables()
         self.mysql_api.close()
-        tables = [table for table in tables if self.config.is_table_matches(table)]
+        tables = [table for table in tables if self.config.is_table_matches(db_name, table)]
 
         self.clickhouse_api.execute_command(f'USE `{db_name}`')
         ch_tables = set(self.clickhouse_api.get_tables())

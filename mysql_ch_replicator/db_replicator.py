@@ -224,7 +224,7 @@ class DbReplicator:
 
             self.state.tables = self.mysql_api.get_tables()
             self.state.tables = [
-                table for table in self.state.tables if self.config.is_table_matches(table)
+                table for table in self.state.tables if self.config.is_table_matches(self.database, table)
             ]
             self.state.last_processed_transaction = self.data_reader.get_last_transaction_id()
             self.state.save()

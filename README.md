@@ -256,9 +256,9 @@ mysql_timezone: 'UTC'    # optional, timezone for MySQL timestamp conversion (de
 
 #### Optional settings
 - `initial_replication_threads` - number of threads for initial replication, by default 1, set it to number of cores to accelerate initial data copy
-- `tables` - tables to filter, list is also supported
+- `tables` - tables to filter, list is also supported. A mapping of database to patterns scopes them to that source database; a database the mapping does not name replicates all its tables
 - `exclude_databases` - databases to __exclude__, string or list, eg `'table1*'` or `['table2', 'table3*']`. If same database matches `databases` and `exclude_databases`, exclude has higher priority.
-- `exclude_tables` - databases to __exclude__, string or list. If same table matches `tables` and `exclude_tables`, exclude has higher priority.
+- `exclude_tables` - tables to __exclude__, string or list, or a mapping of database to those (a database the mapping does not name excludes none). If same table matches `tables` and `exclude_tables`, exclude has higher priority.
 - `target_databases` - if you want database in ClickHouse to have different name from MySQL database
 - `log_level` - log level, default is `info`, you can set to `debug` to get maximum information (allowed values are `debug`, `info`, `warning`, `error`, `critical`)
 - `optimize_interval` - interval (seconds) between automatic `OPTIMIZE table FINAL` calls. Default 86400 (1 day). This is required to perform all merges guaranteed and avoid increasing of used storage and decreasing performance.
@@ -276,6 +276,16 @@ Few more tables / dbs examples:
 ```yaml
 databases: ['my_database_1', 'my_database_2']
 tables: ['table_1', 'table_2*']
+```
+
+Table filters scoped per database (an allow-list for one, an exclude list for the other):
+
+```yaml
+databases: ['my_database_1', 'my_database_2']
+tables:
+  my_database_1: ['table_1', 'table_2*']
+exclude_tables:
+  my_database_2: ['meta_table_*']
 ```
 
 ### Advanced Features

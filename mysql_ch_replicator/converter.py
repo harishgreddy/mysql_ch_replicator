@@ -241,11 +241,13 @@ def convert_timestamp_to_datetime64(input_str, timezone='UTC'):
 
 
 class MysqlToClickhouseConverter:
-    def __init__(self, db_replicator: 'DbReplicator' = None):
+    def __init__(self, db_replicator: 'DbReplicator' = None, exact_decimals: bool = False):
         self.db_replicator = db_replicator
         self.types_mapping = {}
+        self.exact_decimals = exact_decimals
         if self.db_replicator is not None:
             self.types_mapping = db_replicator.config.types_mapping
+            self.exact_decimals = db_replicator.config.is_exact_decimals(db_replicator.database)
 
     @staticmethod
     def _extract_parenthesized_expression(line, start_pos):
@@ -400,6 +402,11 @@ class MysqlToClickhouseConverter:
             if is_unsigned:
                 return 'UInt32'
             return 'Int32'
+        datetime_match = re.match(r'^datetime(?:\((\d+)\))?$', mysql_type)
+        if datetime_match:
+            # DATETIME has no zone; rows are written as naive datetimes, read in the
+            # process zone, and the replicator runs in UTC, so say so on the column.
+            return f"DateTime64({datetime_match.group(1) or 0}, 'UTC')"
         if 'datetime' in mysql_type:
             return mysql_type.replace('datetime', 'DateTime64')
         if 'longtext' in mysql_type:
@@ -426,6 +433,12 @@ class MysqlToClickhouseConverter:
             return 'String'
         if 'json' in mysql_type:
             return 'String'
+        decimal_match = re.match(r'^decimal(?:\((\d+)\s*(?:,\s*(\d+))?\))?$', mysql_type)
+        if decimal_match and self.exact_decimals:
+            # Keep precision and scale: Float64 holds about 15.9 digits, decimal(18,6) needs 18.
+            precision = decimal_match.group(1) or 10
+            scale = decimal_match.group(2) or 0
+            return f'Decimal({precision}, {scale})'
         if 'decimal' in mysql_type:
             return 'Float64'
         if 'float' in mysql_type:
@@ -461,10 +474,11 @@ class MysqlToClickhouseConverter:
             return 'UInt8'  # MySQL BOOLEAN is an alias for TINYINT(1), stores 0 or 1
         raise Exception(f'unknown mysql type "{mysql_type}"')
 
-    def convert_field_type(self, mysql_type, mysql_parameters):
+    def convert_field_type(self, mysql_type, mysql_parameters, primary_key=False):
         mysql_type = mysql_type.lower()
         mysql_parameters = mysql_parameters.lower()
-        not_null = 'not null' in mysql_parameters
+        # MySQL makes every primary key column NOT NULL, whether or not the DDL says so.
+        not_null = primary_key or 'not null' in mysql_parameters
         clickhouse_type = self.convert_type(mysql_type, mysql_parameters)
         if 'Tuple' in clickhouse_type:
             not_null = True
@@ -490,7 +504,9 @@ class MysqlToClickhouseConverter:
         clickhouse_structure.table_name = mysql_structure.table_name
         clickhouse_structure.if_not_exists = mysql_structure.if_not_exists
         for field in mysql_structure.fields:
-            clickhouse_field_type = self.convert_field_type(field.field_type, field.parameters)
+            clickhouse_field_type = self.convert_field_type(
+                field.field_type, field.parameters, primary_key=field.name in mysql_structure.primary_keys,
+            )
             clickhouse_structure.fields.append(TableField(
                 name=field.name,
                 field_type=clickhouse_field_type,
@@ -528,8 +544,9 @@ class MysqlToClickhouseConverter:
             mysql_field_type = mysql_field_types[idx]
             clickhouse_field_type = clickhouse_field_types[idx]
 
-            # --- Fix for BIT(1) fields ---
-            if mysql_field_type.startswith('bit(') and mysql_field_type.endswith(')'):
+            # --- Fix for BIT(1) fields --- (a NULL stays NULL: bool(None) would turn it into false)
+            if (clickhouse_field_value is not None
+                    and mysql_field_type.startswith('bit(') and mysql_field_type.endswith(')')):
                 try:
                     bit_len = int(mysql_field_type[4:-1])
                     if bit_len == 1 and 'Bool' in clickhouse_field_type:
@@ -652,12 +669,12 @@ class MysqlToClickhouseConverter:
                 # This is a target database name, so for config matching we need to use the source database
                 matches_config = (
                         self.db_replicator.config.is_database_matches(self.db_replicator.database)
-                        and self.db_replicator.config.is_table_matches(table_name))
+                        and self.db_replicator.config.is_table_matches(self.db_replicator.database, table_name))
             else:
                 # Normal case: check if source database and table match config
                 matches_config = (
                         self.db_replicator.config.is_database_matches(db_name)
-                        and self.db_replicator.config.is_table_matches(table_name))
+                        and self.db_replicator.config.is_table_matches(db_name, table_name))
 
             # Apply database mapping AFTER checking matches_config
             if db_name == self.db_replicator.database:
@@ -1229,7 +1246,9 @@ class MysqlToClickhouseConverter:
         raise Exception('not implement')
 
     def _strip_comments(self, create_statement):
-        pattern = r'\bCOMMENT(?:\s*=\s*|\s+)([\'"])(?:\\.|[^\\])*?\1'
+        # A quote inside a comment is either backslash-escaped or doubled ('' as MySQL and
+        # Liquibase write it); a lazy match up to the next quote would end inside the comment.
+        pattern = r'''\bCOMMENT(?:\s*=\s*|\s+)(?:'(?:[^'\\]|\\.|'')*'|"(?:[^"\\]|\\.|"")*")'''
         return re.sub(pattern, '', create_statement, flags=re.IGNORECASE)
 
     def parse_mysql_table_structure(self, create_statement, required_table_name=None):

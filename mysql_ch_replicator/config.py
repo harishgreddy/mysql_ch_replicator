@@ -128,6 +128,7 @@ class Settings:
         self.http_host = ''
         self.http_port = 0
         self.types_mapping = {}
+        self.exact_decimals = ''
         self.target_databases = {}
         self.initial_replication_threads = 0
         self.ignore_deletes = False
@@ -154,6 +155,7 @@ class Settings:
             'auto_restart_interval', Settings.DEFAULT_AUTO_RESTART_INTERVAL,
         )
         self.types_mapping = data.pop('types_mapping', {})
+        self.exact_decimals = data.pop('exact_decimals', '')
         self.http_host = data.pop('http_host', '')
         self.http_port = data.pop('http_port', 0)
         self.target_databases = data.pop('target_databases', {})
@@ -175,7 +177,10 @@ class Settings:
             )
         
         assert isinstance(self.databases, str) or isinstance(self.databases, list)
-        assert isinstance(self.tables, str) or isinstance(self.tables, list)
+        self.validate_table_patterns('tables', self.tables)
+        self.validate_table_patterns('exclude_tables', self.exclude_tables)
+        if not (isinstance(self.exact_decimals, str) or (isinstance(self.exact_decimals, list) and all(isinstance(d, str) for d in self.exact_decimals))):
+            raise ValueError(f'exact_decimals should be a database pattern or a list of them, not {self.exact_decimals!r}')
         self.binlog_replicator = BinlogReplicatorSettings(**data.pop('binlog_replicator'))
         if data:
             raise Exception(f'Unsupported config options: {list(data.keys())}')
@@ -194,15 +199,37 @@ class Settings:
             return False
         raise ValueError()
 
+    def is_exact_decimals(self, db_name):
+        # Databases whose DECIMAL columns keep precision as ClickHouse Decimal(p, s); others get Float64.
+        return bool(self.exact_decimals) and self.is_pattern_matches(db_name, self.exact_decimals)
+
     def is_database_matches(self, db_name):
         if self.exclude_databases and self.is_pattern_matches(db_name, self.exclude_databases):
             return False
         return self.is_pattern_matches(db_name, self.databases)
 
-    def is_table_matches(self, table_name):
-        if self.exclude_tables and self.is_pattern_matches(table_name, self.exclude_tables):
+    @staticmethod
+    def validate_table_patterns(option, patterns):
+        # A plain string or list applies to every database; a mapping scopes the patterns
+        # to the source database named by each key.
+        scoped = patterns.values() if isinstance(patterns, dict) else [patterns]
+        for value in scoped:
+            is_list = isinstance(value, list) and all(isinstance(v, str) for v in value)
+            if not (isinstance(value, str) or is_list):
+                raise ValueError(f'{option} should be a pattern, a list of patterns, '
+                                 f'or a mapping of database to those, not {value!r}')
+
+    @staticmethod
+    def table_patterns_for(patterns, db_name, default):
+        if isinstance(patterns, dict):
+            return patterns.get(db_name, default)
+        return patterns
+
+    def is_table_matches(self, db_name, table_name):
+        exclude_tables = self.table_patterns_for(self.exclude_tables, db_name, '')
+        if exclude_tables and self.is_pattern_matches(table_name, exclude_tables):
             return False
-        return self.is_pattern_matches(table_name, self.tables)
+        return self.is_pattern_matches(table_name, self.table_patterns_for(self.tables, db_name, '*'))
 
     def validate_log_level(self):
         if self.log_level not in ['critical', 'error', 'warning', 'info', 'debug']:
